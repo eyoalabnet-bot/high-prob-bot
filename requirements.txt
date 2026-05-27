@@ -1,2 +1,2 @@
 numpy
-flask
+requests
