@@ -3,7 +3,7 @@
 High Probability Trading Bot – Adaptive + Cooldown
 - Real Bitcoin price (CoinGecko, rate‑limit safe)
 - Learns which patterns work in current market
-- 5‑minute cooldown after each trade (prevents overtrading)
+- 5‑minute cooldown after each trade
 - Minimum price movement filter (0.3%)
 - Simulated trading only – no real orders
 - Starting balance: $400
@@ -16,7 +16,6 @@ import urllib.request
 import numpy as np
 from datetime import datetime
 
-# ---------- Setup logging ----------
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -24,7 +23,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("high_prob_bot")
 
-# ---------- Rate‑limit safe price feed ----------
 class RealCryptoData:
     def __init__(self):
         self.cached_price = 50000.0
@@ -83,7 +81,6 @@ class RealCryptoData:
             price = close
         return candles
 
-# ---------- Adaptive Parameter Manager ----------
 class AdaptiveParams:
     def __init__(self):
         self.pattern_weights = {'engulfing': 1.0, 'divergence': 1.0, 'double': 1.0}
@@ -111,13 +108,11 @@ class AdaptiveParams:
         if now - self.last_update_time < self.update_interval:
             return
         self.last_update_time = now
-        # Weight patterns by recent win rate (softmax-like)
         total = sum(max(0.2, self.recent_winrate[p]) for p in self.pattern_weights)
         for p in self.pattern_weights:
             raw = max(0.2, self.recent_winrate[p])
             self.pattern_weights[p] = raw / total
 
-        # Adjust RSI thresholds based on divergence performance
         div_win = self.recent_winrate.get('divergence', 0.5)
         if div_win > 0.6:
             self.rsi_oversold = max(20, self.rsi_oversold - 2)
@@ -126,14 +121,12 @@ class AdaptiveParams:
             self.rsi_oversold = min(40, self.rsi_oversold + 2)
             self.rsi_overbought = max(60, self.rsi_overbought - 2)
 
-        # Adjust volume spike factor based on engulfing performance
         eng_win = self.recent_winrate.get('engulfing', 0.5)
         if eng_win > 0.6:
             self.volume_spike_factor = max(1.2, self.volume_spike_factor - 0.1)
         elif eng_win < 0.4:
             self.volume_spike_factor = min(3.0, self.volume_spike_factor + 0.2)
 
-        # Adjust double pattern tolerance based on its win rate
         dbl_win = self.recent_winrate.get('double', 0.5)
         if dbl_win > 0.6:
             self.double_pattern_tolerance = max(0.002, self.double_pattern_tolerance - 0.0005)
@@ -143,22 +136,19 @@ class AdaptiveParams:
         log.info(f"Adaptation: weights={self.pattern_weights}, RSI({self.rsi_oversold}/{self.rsi_overbought}), vol_spike={self.volume_spike_factor:.2f}, double_tol={self.double_pattern_tolerance:.4f}")
 
     def choose_pattern(self) -> str:
-        """Select a pattern based on weights, ensuring probabilities sum to 1."""
         patterns = list(self.pattern_weights.keys())
         probs = [self.pattern_weights[p] for p in patterns]
         # Normalize to fix floating point rounding errors
         total = sum(probs)
         if total <= 0:
-            # Fallback to equal probabilities
             probs = [1.0 / len(patterns)] * len(patterns)
         else:
             probs = [p / total for p in probs]
-        # Epsilon‑greedy exploration (10% random)
+        # Epsilon‑greedy (10% random)
         if np.random.random() < 0.1:
             return np.random.choice(patterns)
         return np.random.choice(patterns, p=probs)
 
-# ---------- Adaptive Strategy ----------
 class AdaptiveHighProbStrategy:
     def __init__(self, data_client, adaptive_params):
         self.data = data_client
@@ -175,7 +165,6 @@ class AdaptiveHighProbStrategy:
         prev = candles[-2]
         avg_vol = np.mean([c['volume'] for c in candles[-5:]])
         vol_spike = last['volume'] > avg_vol * self.adaptive.volume_spike_factor
-
         if (prev['close'] < prev['open'] and last['close'] > last['open'] and
             last['close'] > prev['open'] and last['open'] < prev['close'] and
             last['low'] <= prev_close <= last['high'] and last['close'] > prev_close and vol_spike):
@@ -245,7 +234,6 @@ class AdaptiveHighProbStrategy:
             return sig
         return None
 
-# ---------- Simulated Order Manager with Cooldown ----------
 class AdaptiveOrderManager:
     def __init__(self, data_client, adaptive_params):
         self.data = data_client
@@ -256,9 +244,9 @@ class AdaptiveOrderManager:
         self.balance = 400.0
         self.trades = []
         self.last_trade_time = 0
-        self.cooldown_seconds = 300          # 5 minutes
+        self.cooldown_seconds = 300
         self.last_price_at_trade = 0.0
-        self.min_price_change_pct = 0.003    # 0.3%
+        self.min_price_change_pct = 0.003
 
     def can_enter(self, current_price) -> bool:
         now = time.time()
@@ -298,17 +286,14 @@ class AdaptiveOrderManager:
         if self.position != 0:
             self.execute_sell(price)
 
-# ---------- Main Loop ----------
 def main():
     log.info("Adaptive High Probability Bot – Cooldown + Learning (Simulated)")
     data = RealCryptoData()
     adaptive = AdaptiveParams()
     strategy = AdaptiveHighProbStrategy(data, adaptive)
     orders = AdaptiveOrderManager(data, adaptive)
-
     CONTRACTS = 1
     SCAN_SECONDS = 15
-
     try:
         while True:
             price = data.get_last_price()
@@ -321,7 +306,6 @@ def main():
                     if int(time.time()) % 60 < SCAN_SECONDS:
                         log.info(f"Cooldown or price stale – no entry. BTC: ${price:,.2f}")
             else:
-                # Simple exit after 30 seconds (you can change to trailing stop)
                 if time.time() - orders.last_trade_time > 30:
                     orders.execute_sell(price, CONTRACTS)
                 else:
