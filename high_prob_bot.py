@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
 High Probability Trading Bot – Adaptive + Cooldown + Trailing Stop
-- Real Bitcoin price from Binance (with fallback to CoinGecko)
-- Real candles from Binance (fallback to simulated if fails)
-- Learns which patterns work
-- 5‑minute cooldown, price movement filter, trailing stop, profit target
+- Real Bitcoin price (KuCoin public API, no key)
+- Real 1m, 5m, 15m candles from KuCoin (no more fake patterns)
+- Learns which patterns work in current market
+- 5‑minute cooldown after each trade
+- Minimum price movement filter (0.3%)
+- Trailing stop (0.2% from highest price since entry)
+- Profit target (1% from entry price)
 - Simulated trading only – no real orders
+- Starting balance: $400
 """
 
 import time
@@ -22,78 +26,74 @@ logging.basicConfig(
 )
 log = logging.getLogger("high_prob_bot")
 
-# ---------- Market Data with Fallback ----------
+# ---------- Real Market Data from KuCoin (Public API, No Key Required) ----------
 class RealMarketData:
     def __init__(self):
-        self.binance_url = "https://api.binance.com/api/v3"
-        self.coingecko_url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
-        self.symbol = "BTCUSDT"
+        self.kucoin_base = "https://api.kucoin.com/api/v1"
+        self.symbol = "BTC-USDT"
         self.cached_price = 50000.0
         self.last_price_fetch = 0
-        self.price_cache_ttl = 10
-        self.last_candles = {}  # cache for candles
-        self.use_fallback = False
-
-    def _fetch_binance(self, endpoint, params=None):
-        try:
-            response = requests.get(f"{self.binance_url}/{endpoint}", params=params, timeout=10)
-            if response.status_code == 200:
-                return response.json()
-            else:
-                log.warning(f"Binance {endpoint} returned {response.status_code}, using fallback")
-                self.use_fallback = True
-                return None
-        except Exception as e:
-            log.warning(f"Binance error: {e}, using fallback")
-            self.use_fallback = True
-            return None
+        self.price_cache_ttl = 5  # seconds
+        self.kucoin_interval_map = {
+            1: "1min", 5: "5min", 15: "15min", 60: "1hour",
+            240: "4hour", 1440: "1day"
+        }
 
     def get_current_price(self) -> float:
-        """Get real price from Binance or fallback to CoinGecko."""
+        """Get real-time BTC price from KuCoin public ticker endpoint."""
         now = time.time()
         if now - self.last_price_fetch < self.price_cache_ttl:
             return self.cached_price
 
-        # Try Binance first
-        data = self._fetch_binance("ticker/price", {"symbol": self.symbol})
-        if data and "price" in data:
-            self.cached_price = float(data["price"])
-            self.last_price_fetch = now
-            return self.cached_price
-
-        # Fallback to CoinGecko
         try:
-            resp = requests.get(self.coingecko_url, timeout=10)
-            if resp.status_code == 200:
-                price = resp.json()['bitcoin']['usd']
-                self.cached_price = price
-                self.last_price_fetch = now
-                return price
+            url = f"{self.kucoin_base}/market/stats?symbol={self.symbol}"
+            response = requests.get(url, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("code") == "200000":
+                    self.cached_price = float(data["data"]["last"])
+                    self.last_price_fetch = now
+                    return self.cached_price
+            log.warning(f"KuCoin price returned {response.status_code}, using cached")
         except Exception as e:
-            log.error(f"CoinGecko error: {e}")
+            log.warning(f"KuCoin price error: {e}, using cached")
 
-        return self.cached_price
+        return self.cached_price if self.cached_price else 50000.0
 
     def get_historical_candles(self, interval: str, limit: int = 50) -> list:
-        """Fetch real candles or return simulated if unavailable."""
-        # Try real data first
-        data = self._fetch_binance("klines", {"symbol": self.symbol, "interval": interval, "limit": limit})
-        if data:
-            candles = []
-            for candle in data:
-                candles.append({
-                    "timestamp": candle[0],
-                    "open": float(candle[1]),
-                    "high": float(candle[2]),
-                    "low": float(candle[3]),
-                    "close": float(candle[4]),
-                    "volume": float(candle[5])
-                })
-            return candles
-        else:
-            # Fallback: generate realistic simulated candles
-            log.warning(f"Using simulated candles for {interval}")
-            return self._generate_simulated_candles(limit)
+        """
+        Fetch real OHLCV candles from KuCoin's public API.
+        Returns list of candles with keys: timestamp, open, high, low, close, volume.
+        """
+        try:
+            url = f"{self.kucoin_base}/market/candles"
+            params = {
+                "symbol": self.symbol,
+                "type": interval,
+                "limit": limit
+            }
+            response = requests.get(url, params=params, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("code") == "200000" and data.get("data"):
+                    candles = []
+                    for item in data["data"]:
+                        candles.append({
+                            "timestamp": int(item[0]),
+                            "open": float(item[1]),
+                            "high": float(item[2]),
+                            "low": float(item[3]),
+                            "close": float(item[4]),
+                            "volume": float(item[5])  # volume is at index 5 in KuCoin response
+                        })
+                    return candles
+            log.warning(f"KuCoin candles returned {response.status_code}, using fallback")
+        except Exception as e:
+            log.warning(f"KuCoin candles error: {e}, using fallback")
+
+        # Fallback to simulated candles
+        log.warning(f"Using simulated candles for {interval}")
+        return self._generate_simulated_candles(limit)
 
     def _generate_simulated_candles(self, count: int) -> list:
         """Generate realistic random candles based on current price."""
@@ -117,21 +117,22 @@ class RealMarketData:
         return candles
 
     def get_previous_session_close(self) -> float:
-        """Return 1-hour close (real if available)."""
-        candles = self.get_historical_candles("1h", 2)
+        """Return 1 hour close as previous session close."""
+        candles = self.get_historical_candles("1hour", 2)
         if len(candles) >= 2:
             return candles[-2]["close"]
         return self.get_current_price() * 0.98
 
     def generate_candles(self, timeframe_min: int, count: int) -> list:
-        """Fetch candles by timeframe (1,5,15,60,240,1440)."""
-        interval_map = {
-            1: "1m", 5: "5m", 15: "15m", 60: "1h", 240: "4h", 1440: "1d"
-        }
-        if timeframe_min not in interval_map:
+        """
+        Fetch real KuCoin candles by timeframe (1,5,15,60,240,1440).
+        Falls back to simulated if API fails.
+        """
+        if timeframe_min not in self.kucoin_interval_map:
             raise ValueError(f"Unsupported timeframe {timeframe_min}")
-        interval = interval_map[timeframe_min]
+        interval = self.kucoin_interval_map[timeframe_min]
         return self.get_historical_candles(interval, count)
+
 
 # ---------- Adaptive Strategy (unchanged, but safer) ----------
 class AdaptiveParams:
@@ -200,6 +201,7 @@ class AdaptiveParams:
             return np.random.choice(patterns)
         return np.random.choice(patterns, p=probs)
 
+
 class AdaptiveHighProbStrategy:
     def __init__(self, data_client, adaptive_params):
         self.data = data_client
@@ -208,7 +210,7 @@ class AdaptiveHighProbStrategy:
         self.last_pattern_used = None
 
     def check_engulfing_with_volume(self, current_price):
-        candles = self.data.generate_candles(1, 5)
+        candles = self.data.generate_candles(1, 5)  # 1-minute candles
         if len(candles) < 2:
             return None
         prev_close = self.data.get_previous_session_close()
@@ -216,10 +218,12 @@ class AdaptiveHighProbStrategy:
         prev = candles[-2]
         avg_vol = np.mean([c['volume'] for c in candles[-5:]])
         vol_spike = last['volume'] > avg_vol * self.adaptive.volume_spike_factor
+        # Bullish engulfing
         if (prev['close'] < prev['open'] and last['close'] > last['open'] and
             last['close'] > prev['open'] and last['open'] < prev['close'] and
             last['low'] <= prev_close <= last['high'] and last['close'] > prev_close and vol_spike):
             return "BUY"
+        # Bearish engulfing
         elif (prev['close'] > prev['open'] and last['close'] < last['open'] and
               last['close'] < prev['open'] and last['open'] > prev['close'] and
               last['high'] >= prev_close >= last['low'] and last['close'] < prev_close and vol_spike):
@@ -247,7 +251,6 @@ class AdaptiveHighProbStrategy:
         if len(prices_15m) < 6:
             return None
         rsi = self.calculate_rsi(prices_15m)
-        # Need at least 5 previous prices for comparison
         if len(prices_15m) >= 6:
             if prices_15m[-1] < prices_15m[-5] and rsi > self.calculate_rsi(prices_15m[:-5]):
                 if rsi < self.adaptive.rsi_oversold:
@@ -303,7 +306,8 @@ class AdaptiveHighProbStrategy:
             log.error(f"Pattern error: {e}")
         return None
 
-# ---------- Order Manager (simulated) ----------
+
+# ---------- Simulated Order Manager (no real orders) ----------
 class AdaptiveOrderManager:
     def __init__(self, data_client, adaptive_params):
         self.data = data_client
@@ -314,7 +318,7 @@ class AdaptiveOrderManager:
         self.balance = 400.0
         self.trades = []
         self.last_trade_time = 0
-        self.cooldown_seconds = 300
+        self.cooldown_seconds = 300  # 5 minutes
         self.last_price_at_trade = 0.0
         self.min_price_change_pct = 0.003
         self.trailing_stop_pct = 0.002
@@ -345,6 +349,7 @@ class AdaptiveOrderManager:
         log.info(f"🔵 BUY {contracts} BTC (simulated) @ ${price:,.2f} (Pattern: {pattern})")
 
     def update_exit(self, current_price):
+        """Return True if trailing stop or profit target is hit."""
         if self.position == 0:
             return False
         if current_price > self.highest_price:
@@ -376,8 +381,10 @@ class AdaptiveOrderManager:
         if self.position != 0:
             self.execute_sell(price)
 
+
+# ---------- Main Loop ----------
 def main():
-    log.info("Adaptive High Probability Bot – Real Data with Fallback")
+    log.info("Adaptive High Probability Bot – Real KuCoin Data + Fallback")
     log.info("Trailing stop: 0.2% | Profit target: 1% | Cooldown: 5 min")
     data = RealMarketData()
     adaptive = AdaptiveParams()
