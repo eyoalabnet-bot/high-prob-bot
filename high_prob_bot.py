@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-High Probability Trading Bot – Adaptive + Cooldown
+High Probability Trading Bot – Adaptive + Cooldown + Trailing Stop
 - Real Bitcoin price (CoinGecko, rate‑limit safe)
 - Learns which patterns work in current market
 - 5‑minute cooldown after each trade
 - Minimum price movement filter (0.3%)
+- Trailing stop (0.2% from highest price since entry)
+- Profit target (1% from entry price)
 - Simulated trading only – no real orders
 - Starting balance: $400
 """
@@ -138,13 +140,11 @@ class AdaptiveParams:
     def choose_pattern(self) -> str:
         patterns = list(self.pattern_weights.keys())
         probs = [self.pattern_weights[p] for p in patterns]
-        # Normalize to fix floating point rounding errors
         total = sum(probs)
         if total <= 0:
             probs = [1.0 / len(patterns)] * len(patterns)
         else:
             probs = [p / total for p in probs]
-        # Epsilon‑greedy (10% random)
         if np.random.random() < 0.1:
             return np.random.choice(patterns)
         return np.random.choice(patterns, p=probs)
@@ -248,6 +248,11 @@ class AdaptiveOrderManager:
         self.last_price_at_trade = 0.0
         self.min_price_change_pct = 0.003
 
+        # New exit parameters
+        self.trailing_stop_pct = 0.002   # 0.2% trail from highest price
+        self.profit_target_pct = 0.01    # 1% profit target
+        self.highest_price = 0.0
+
     def can_enter(self, current_price) -> bool:
         now = time.time()
         if self.position != 0:
@@ -268,7 +273,32 @@ class AdaptiveOrderManager:
         self.entry_pattern = pattern
         self.last_trade_time = time.time()
         self.last_price_at_trade = price
+        # Initialize trailing stop tracking
+        self.highest_price = price
         log.info(f"🔵 BUY {contracts} BTC (simulated) @ ${price:,.2f} (Pattern: {pattern})")
+
+    def update_exit(self, current_price):
+        """Update trailing stop and check exit conditions. Returns True if should exit."""
+        if self.position == 0:
+            return False
+
+        # Update highest price seen since entry
+        if current_price > self.highest_price:
+            self.highest_price = current_price
+
+        # Profit target (1% from entry)
+        profit_target = self.entry_price * (1 + self.profit_target_pct)
+        if current_price >= profit_target:
+            log.info(f"Profit target hit {self.profit_target_pct*100}%")
+            return True
+
+        # Trailing stop (0.2% below highest price)
+        trail_stop = self.highest_price * (1 - self.trailing_stop_pct)
+        if current_price <= trail_stop:
+            log.info(f"Trailing stop hit (high: {self.highest_price:.2f}, stop: {trail_stop:.2f})")
+            return True
+
+        return False
 
     def execute_sell(self, price: float, contracts: int = 1):
         if self.position == 0:
@@ -281,19 +311,21 @@ class AdaptiveOrderManager:
         self.position = 0
         self.entry_price = 0.0
         self.entry_pattern = None
+        self.highest_price = 0.0
 
     def force_exit(self, price):
         if self.position != 0:
             self.execute_sell(price)
 
 def main():
-    log.info("Adaptive High Probability Bot – Cooldown + Learning (Simulated)")
+    log.info("Adaptive High Probability Bot – Cooldown + Trailing Stop + Profit Target")
     data = RealCryptoData()
     adaptive = AdaptiveParams()
     strategy = AdaptiveHighProbStrategy(data, adaptive)
     orders = AdaptiveOrderManager(data, adaptive)
     CONTRACTS = 1
     SCAN_SECONDS = 15
+
     try:
         while True:
             price = data.get_last_price()
@@ -306,11 +338,12 @@ def main():
                     if int(time.time()) % 60 < SCAN_SECONDS:
                         log.info(f"Cooldown or price stale – no entry. BTC: ${price:,.2f}")
             else:
-                if time.time() - orders.last_trade_time > 30:
+                # Check trailing stop and profit target every cycle
+                if orders.update_exit(price):
                     orders.execute_sell(price, CONTRACTS)
                 else:
                     if int(time.time()) % 30 < SCAN_SECONDS:
-                        log.info(f"Holding BTC @ ${price:,.2f} | Entry: ${orders.entry_price:,.2f} | Pattern: {orders.entry_pattern}")
+                        log.info(f"Holding BTC @ ${price:,.2f} | Entry: ${orders.entry_price:,.2f} | High: ${orders.highest_price:,.2f} | Pattern: {orders.entry_pattern}")
             time.sleep(SCAN_SECONDS)
     except KeyboardInterrupt:
         log.info("Shutting down – force closing any open position")
