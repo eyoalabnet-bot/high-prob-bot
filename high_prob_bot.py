@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
 """
 High Probability Trading Bot – Adaptive + Cooldown + Trailing Stop
-- Real Bitcoin price (Binance, free API)
-- Real 1m, 5m, 15m candles (no more fake patterns)
-- Learns which patterns work in current market
-- 5‑minute cooldown after each trade
-- Minimum price movement filter (0.3%)
-- Trailing stop (0.2% from highest price since entry)
-- Profit target (1% from entry price)
+- Real Bitcoin price from Binance (with fallback to CoinGecko)
+- Real candles from Binance (fallback to simulated if fails)
+- Learns which patterns work
+- 5‑minute cooldown, price movement filter, trailing stop, profit target
 - Simulated trading only – no real orders
-- Starting balance: $400
 """
 
 import time
 import logging
 import numpy as np
 import requests
+import random
 from datetime import datetime
 
 logging.basicConfig(
@@ -25,84 +22,118 @@ logging.basicConfig(
 )
 log = logging.getLogger("high_prob_bot")
 
-# ---------- Real Market Data from Binance ----------
+# ---------- Market Data with Fallback ----------
 class RealMarketData:
     def __init__(self):
-        self.base_url = "https://api.binance.com/api/v3"
+        self.binance_url = "https://api.binance.com/api/v3"
+        self.coingecko_url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
         self.symbol = "BTCUSDT"
-        self.cached_price = 0.0
+        self.cached_price = 50000.0
         self.last_price_fetch = 0
-        self.price_cache_ttl = 5  # seconds
+        self.price_cache_ttl = 10
+        self.last_candles = {}  # cache for candles
+        self.use_fallback = False
 
     def _fetch_binance(self, endpoint, params=None):
-        """Make a request to Binance public API (no API key needed)."""
         try:
-            response = requests.get(f"{self.base_url}/{endpoint}", params=params, timeout=10)
-            response.raise_for_status()
-            return response.json()
+            response = requests.get(f"{self.binance_url}/{endpoint}", params=params, timeout=10)
+            if response.status_code == 200:
+                return response.json()
+            else:
+                log.warning(f"Binance {endpoint} returned {response.status_code}, using fallback")
+                self.use_fallback = True
+                return None
         except Exception as e:
-            log.error(f"Binance API error: {e}")
+            log.warning(f"Binance error: {e}, using fallback")
+            self.use_fallback = True
             return None
 
     def get_current_price(self) -> float:
-        """Get real-time BTC price from Binance (cached 5 sec)."""
+        """Get real price from Binance or fallback to CoinGecko."""
         now = time.time()
         if now - self.last_price_fetch < self.price_cache_ttl:
             return self.cached_price
 
+        # Try Binance first
         data = self._fetch_binance("ticker/price", {"symbol": self.symbol})
         if data and "price" in data:
             self.cached_price = float(data["price"])
             self.last_price_fetch = now
             return self.cached_price
-        return self.cached_price if self.cached_price else 50000.0
+
+        # Fallback to CoinGecko
+        try:
+            resp = requests.get(self.coingecko_url, timeout=10)
+            if resp.status_code == 200:
+                price = resp.json()['bitcoin']['usd']
+                self.cached_price = price
+                self.last_price_fetch = now
+                return price
+        except Exception as e:
+            log.error(f"CoinGecko error: {e}")
+
+        return self.cached_price
 
     def get_historical_candles(self, interval: str, limit: int = 50) -> list:
-        """Fetch real OHLCV candles from Binance.
-        Interval: '1m', '5m', '15m', '1h', '4h', '1d' etc.
-        Returns list of candles with keys: timestamp, open, high, low, close, volume.
-        """
+        """Fetch real candles or return simulated if unavailable."""
+        # Try real data first
         data = self._fetch_binance("klines", {"symbol": self.symbol, "interval": interval, "limit": limit})
-        if not data:
-            return []
+        if data:
+            candles = []
+            for candle in data:
+                candles.append({
+                    "timestamp": candle[0],
+                    "open": float(candle[1]),
+                    "high": float(candle[2]),
+                    "low": float(candle[3]),
+                    "close": float(candle[4]),
+                    "volume": float(candle[5])
+                })
+            return candles
+        else:
+            # Fallback: generate realistic simulated candles
+            log.warning(f"Using simulated candles for {interval}")
+            return self._generate_simulated_candles(limit)
+
+    def _generate_simulated_candles(self, count: int) -> list:
+        """Generate realistic random candles based on current price."""
+        current_price = self.get_current_price()
         candles = []
-        for candle in data:
+        price = current_price
+        for _ in range(count):
+            change = np.random.normal(0, 0.002) * price
+            close = price + change
+            high = max(price, close) + abs(change) * random.uniform(0.2, 0.8)
+            low = min(price, close) - abs(change) * random.uniform(0.2, 0.8)
             candles.append({
-                "timestamp": candle[0],
-                "open": float(candle[1]),
-                "high": float(candle[2]),
-                "low": float(candle[3]),
-                "close": float(candle[4]),
-                "volume": float(candle[5])
+                "timestamp": int(time.time() * 1000),
+                "open": round(price, 2),
+                "high": round(high, 2),
+                "low": round(low, 2),
+                "close": round(close, 2),
+                "volume": random.randint(100, 10000)
             })
+            price = close
         return candles
 
     def get_previous_session_close(self) -> float:
-        """Return 1 hour close as previous session close."""
+        """Return 1-hour close (real if available)."""
         candles = self.get_historical_candles("1h", 2)
         if len(candles) >= 2:
             return candles[-2]["close"]
         return self.get_current_price() * 0.98
 
-    def generate_candles(self, timeframe_min: int, count: int, current_price=None) -> list:
-        """
-        Fetch REAL candles from Binance based on timeframe.
-        This replaces the old random-walk simulation.
-        """
+    def generate_candles(self, timeframe_min: int, count: int) -> list:
+        """Fetch candles by timeframe (1,5,15,60,240,1440)."""
         interval_map = {
-            1: "1m",
-            5: "5m",
-            15: "15m",
-            60: "1h",
-            240: "4h",
-            1440: "1d"
+            1: "1m", 5: "5m", 15: "15m", 60: "1h", 240: "4h", 1440: "1d"
         }
         if timeframe_min not in interval_map:
-            raise ValueError(f"Timeframe {timeframe_min} not supported. Use 1,5,15,60,240,1440")
+            raise ValueError(f"Unsupported timeframe {timeframe_min}")
         interval = interval_map[timeframe_min]
         return self.get_historical_candles(interval, count)
 
-# ---------- Adaptive Strategy (same as before, but uses real candles) ----------
+# ---------- Adaptive Strategy (unchanged, but safer) ----------
 class AdaptiveParams:
     def __init__(self):
         self.pattern_weights = {'engulfing': 1.0, 'divergence': 1.0, 'double': 1.0}
@@ -177,7 +208,7 @@ class AdaptiveHighProbStrategy:
         self.last_pattern_used = None
 
     def check_engulfing_with_volume(self, current_price):
-        candles = self.data.generate_candles(1, 5)  # 1-minute candles
+        candles = self.data.generate_candles(1, 5)
         if len(candles) < 2:
             return None
         prev_close = self.data.get_previous_session_close()
@@ -201,38 +232,53 @@ class AdaptiveHighProbStrategy:
         deltas = np.diff(prices[-period-1:])
         gains = np.where(deltas > 0, deltas, 0)
         losses = np.where(deltas < 0, -deltas, 0)
-        avg_gain = np.mean(gains)
-        avg_loss = np.mean(losses)
+        avg_gain = np.mean(gains) if len(gains) else 0
+        avg_loss = np.mean(losses) if len(losses) else 0
         if avg_loss == 0:
             return 100.0
         rs = avg_gain / avg_loss
         return 100 - (100 / (1 + rs))
 
     def check_divergence(self, current_price):
-        prices_15m = [c['close'] for c in self.data.generate_candles(15, 30)]
+        candles = self.data.generate_candles(15, 30)
+        if len(candles) < 10:
+            return None
+        prices_15m = [c['close'] for c in candles]
+        if len(prices_15m) < 6:
+            return None
         rsi = self.calculate_rsi(prices_15m)
-        if prices_15m[-1] < prices_15m[-5] and rsi > self.calculate_rsi(prices_15m[:-5]):
-            if rsi < self.adaptive.rsi_oversold:
-                return "BUY"
-        if prices_15m[-1] > prices_15m[-5] and rsi < self.calculate_rsi(prices_15m[:-5]):
-            if rsi > self.adaptive.rsi_overbought:
-                return "SELL"
+        # Need at least 5 previous prices for comparison
+        if len(prices_15m) >= 6:
+            if prices_15m[-1] < prices_15m[-5] and rsi > self.calculate_rsi(prices_15m[:-5]):
+                if rsi < self.adaptive.rsi_oversold:
+                    return "BUY"
+            if prices_15m[-1] > prices_15m[-5] and rsi < self.calculate_rsi(prices_15m[:-5]):
+                if rsi > self.adaptive.rsi_overbought:
+                    return "SELL"
         return None
 
     def check_double_pattern(self, current_price):
         candles = self.data.generate_candles(5, 50)
+        if len(candles) < 30:
+            return None
         lows = [c['low'] for c in candles[-30:]]
         highs = [c['high'] for c in candles[-30:]]
+        if not lows or not highs:
+            return None
         min1 = min(lows)
         idx1 = lows.index(min1)
         lows2 = lows[:idx1] + lows[idx1+1:]
-        min2 = min(lows2) if lows2 else min1
+        if not lows2:
+            return None
+        min2 = min(lows2)
         if abs(min1 - min2) / min1 < self.adaptive.double_pattern_tolerance and candles[-1]['close'] > min1 * 1.003:
             return "BUY"
         max1 = max(highs)
         idx1 = highs.index(max1)
         highs2 = highs[:idx1] + highs[idx1+1:]
-        max2 = max(highs2) if highs2 else max1
+        if not highs2:
+            return None
+        max2 = max(highs2)
         if abs(max1 - max2) / max1 < self.adaptive.double_pattern_tolerance and candles[-1]['close'] < max1 * 0.997:
             return "SELL"
         return None
@@ -241,20 +287,23 @@ class AdaptiveHighProbStrategy:
         self.adaptive.adapt_parameters()
         pattern = self.adaptive.choose_pattern()
         self.last_pattern_used = pattern
-        if pattern == 'engulfing':
-            sig = self.check_engulfing_with_volume(current_price)
-        elif pattern == 'divergence':
-            sig = self.check_divergence(current_price)
-        elif pattern == 'double':
-            sig = self.check_double_pattern(current_price)
-        else:
-            sig = None
-        if sig:
-            self.last_signal = f"{pattern.upper()} {sig}"
-            return sig
+        try:
+            if pattern == 'engulfing':
+                sig = self.check_engulfing_with_volume(current_price)
+            elif pattern == 'divergence':
+                sig = self.check_divergence(current_price)
+            elif pattern == 'double':
+                sig = self.check_double_pattern(current_price)
+            else:
+                sig = None
+            if sig:
+                self.last_signal = f"{pattern.upper()} {sig}"
+                return sig
+        except Exception as e:
+            log.error(f"Pattern error: {e}")
         return None
 
-# ---------- Simulated Order Manager (no real orders) ----------
+# ---------- Order Manager (simulated) ----------
 class AdaptiveOrderManager:
     def __init__(self, data_client, adaptive_params):
         self.data = data_client
@@ -296,18 +345,17 @@ class AdaptiveOrderManager:
         log.info(f"🔵 BUY {contracts} BTC (simulated) @ ${price:,.2f} (Pattern: {pattern})")
 
     def update_exit(self, current_price):
-        """Return True if trailing stop or profit target is hit."""
         if self.position == 0:
             return False
         if current_price > self.highest_price:
             self.highest_price = current_price
         profit_target = self.entry_price * (1 + self.profit_target_pct)
         if current_price >= profit_target:
-            log.info(f"Profit target hit {self.profit_target_pct*100}%")
+            log.info(f"✅ Profit target hit ({self.profit_target_pct*100}%)")
             return True
         trail_stop = self.highest_price * (1 - self.trailing_stop_pct)
         if current_price <= trail_stop:
-            log.info(f"Trailing stop hit (high: {self.highest_price:.2f}, stop: {trail_stop:.2f})")
+            log.info(f"🔻 Trailing stop hit (high: {self.highest_price:.2f}, stop: {trail_stop:.2f})")
             return True
         return False
 
@@ -329,7 +377,7 @@ class AdaptiveOrderManager:
             self.execute_sell(price)
 
 def main():
-    log.info("Adaptive High Probability Bot – Real Binance Data")
+    log.info("Adaptive High Probability Bot – Real Data with Fallback")
     log.info("Trailing stop: 0.2% | Profit target: 1% | Cooldown: 5 min")
     data = RealMarketData()
     adaptive = AdaptiveParams()
@@ -348,16 +396,16 @@ def main():
                         orders.execute_buy(price, strategy.last_pattern_used, CONTRACTS)
                 else:
                     if int(time.time()) % 60 < SCAN_SECONDS:
-                        log.info(f"Cooldown or price stale – no entry. BTC: ${price:,.2f}")
+                        log.info(f"⏳ Cooldown or price stale – no entry. BTC: ${price:,.2f}")
             else:
                 if orders.update_exit(price):
                     orders.execute_sell(price, CONTRACTS)
                 else:
                     if int(time.time()) % 30 < SCAN_SECONDS:
-                        log.info(f"Holding BTC @ ${price:,.2f} | Entry: ${orders.entry_price:,.2f} | High: ${orders.highest_price:,.2f} | Pattern: {orders.entry_pattern}")
+                        log.info(f"📈 Holding BTC @ ${price:,.2f} | Entry: ${orders.entry_price:,.2f} | High: ${orders.highest_price:,.2f} | Pattern: {orders.entry_pattern}")
             time.sleep(SCAN_SECONDS)
     except KeyboardInterrupt:
-        log.info("Shutting down – force closing any open position")
+        log.info("Shutting down – closing position")
         if orders.position != 0:
             orders.force_exit(data.get_current_price())
 
