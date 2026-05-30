@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 High Probability Trading Bot – Adaptive + Cooldown + Trailing Stop
-- Real Bitcoin price (CoinGecko, rate‑limit safe)
+- Real Bitcoin price (Binance, free API)
+- Real 1m, 5m, 15m candles (no more fake patterns)
 - Learns which patterns work in current market
 - 5‑minute cooldown after each trade
 - Minimum price movement filter (0.3%)
@@ -13,9 +14,8 @@ High Probability Trading Bot – Adaptive + Cooldown + Trailing Stop
 
 import time
 import logging
-import json
-import urllib.request
 import numpy as np
+import requests
 from datetime import datetime
 
 logging.basicConfig(
@@ -25,64 +25,84 @@ logging.basicConfig(
 )
 log = logging.getLogger("high_prob_bot")
 
-class RealCryptoData:
+# ---------- Real Market Data from Binance ----------
+class RealMarketData:
     def __init__(self):
-        self.cached_price = 50000.0
-        self.last_fetch_time = 0
-        self.cache_ttl = 30
-        self.url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
-        self.error_count = 0
+        self.base_url = "https://api.binance.com/api/v3"
+        self.symbol = "BTCUSDT"
+        self.cached_price = 0.0
+        self.last_price_fetch = 0
+        self.price_cache_ttl = 5  # seconds
 
-    def get_last_price(self, force=False) -> float:
-        now = time.time()
-        if not force and (now - self.last_fetch_time) < self.cache_ttl:
-            return self.cached_price
+    def _fetch_binance(self, endpoint, params=None):
+        """Make a request to Binance public API (no API key needed)."""
         try:
-            with urllib.request.urlopen(self.url, timeout=10) as response:
-                data = json.loads(response.read().decode("utf-8"))
-                self.cached_price = data['bitcoin']['usd']
-                self.last_fetch_time = now
-                self.error_count = 0
-                if self.cache_ttl < 60:
-                    self.cache_ttl = min(self.cache_ttl + 5, 60)
-                return self.cached_price
-        except urllib.error.HTTPError as e:
-            if e.code == 429:
-                self.error_count += 1
-                self.cache_ttl = min(self.cache_ttl + 10, 300)
-                log.warning(f"Rate limit – using cached price, TTL={self.cache_ttl}s")
-                return self.cached_price
-            else:
-                log.error(f"HTTP error: {e}")
-                return self.cached_price
+            response = requests.get(f"{self.base_url}/{endpoint}", params=params, timeout=10)
+            response.raise_for_status()
+            return response.json()
         except Exception as e:
-            log.error(f"Price fetch error: {e}")
+            log.error(f"Binance API error: {e}")
+            return None
+
+    def get_current_price(self) -> float:
+        """Get real-time BTC price from Binance (cached 5 sec)."""
+        now = time.time()
+        if now - self.last_price_fetch < self.price_cache_ttl:
             return self.cached_price
 
-    def get_previous_session_close(self) -> float:
-        return self.get_last_price() * 0.98
+        data = self._fetch_binance("ticker/price", {"symbol": self.symbol})
+        if data and "price" in data:
+            self.cached_price = float(data["price"])
+            self.last_price_fetch = now
+            return self.cached_price
+        return self.cached_price if self.cached_price else 50000.0
 
-    def generate_candles(self, timeframe_min: int, count: int, current_price=None) -> list:
-        if current_price is None:
-            current_price = self.get_last_price()
+    def get_historical_candles(self, interval: str, limit: int = 50) -> list:
+        """Fetch real OHLCV candles from Binance.
+        Interval: '1m', '5m', '15m', '1h', '4h', '1d' etc.
+        Returns list of candles with keys: timestamp, open, high, low, close, volume.
+        """
+        data = self._fetch_binance("klines", {"symbol": self.symbol, "interval": interval, "limit": limit})
+        if not data:
+            return []
         candles = []
-        price = current_price
-        for _ in range(count):
-            change = np.random.normal(0, 0.002) * price
-            close = price + change
-            high = max(price, close) + abs(change) * np.random.uniform(0.2, 0.8)
-            low = min(price, close) - abs(change) * np.random.uniform(0.2, 0.8)
+        for candle in data:
             candles.append({
-                'open': round(price, 2),
-                'high': round(high, 2),
-                'low': round(low, 2),
-                'close': round(close, 2),
-                'volume': int(np.random.uniform(100, 10000)),
-                'timestamp': datetime.now()
+                "timestamp": candle[0],
+                "open": float(candle[1]),
+                "high": float(candle[2]),
+                "low": float(candle[3]),
+                "close": float(candle[4]),
+                "volume": float(candle[5])
             })
-            price = close
         return candles
 
+    def get_previous_session_close(self) -> float:
+        """Return 1 hour close as previous session close."""
+        candles = self.get_historical_candles("1h", 2)
+        if len(candles) >= 2:
+            return candles[-2]["close"]
+        return self.get_current_price() * 0.98
+
+    def generate_candles(self, timeframe_min: int, count: int, current_price=None) -> list:
+        """
+        Fetch REAL candles from Binance based on timeframe.
+        This replaces the old random-walk simulation.
+        """
+        interval_map = {
+            1: "1m",
+            5: "5m",
+            15: "15m",
+            60: "1h",
+            240: "4h",
+            1440: "1d"
+        }
+        if timeframe_min not in interval_map:
+            raise ValueError(f"Timeframe {timeframe_min} not supported. Use 1,5,15,60,240,1440")
+        interval = interval_map[timeframe_min]
+        return self.get_historical_candles(interval, count)
+
+# ---------- Adaptive Strategy (same as before, but uses real candles) ----------
 class AdaptiveParams:
     def __init__(self):
         self.pattern_weights = {'engulfing': 1.0, 'divergence': 1.0, 'double': 1.0}
@@ -157,7 +177,7 @@ class AdaptiveHighProbStrategy:
         self.last_pattern_used = None
 
     def check_engulfing_with_volume(self, current_price):
-        candles = self.data.generate_candles(1, 5, current_price=current_price)
+        candles = self.data.generate_candles(1, 5)  # 1-minute candles
         if len(candles) < 2:
             return None
         prev_close = self.data.get_previous_session_close()
@@ -175,8 +195,21 @@ class AdaptiveHighProbStrategy:
             return "SELL"
         return None
 
+    def calculate_rsi(self, prices: list, period=14) -> float:
+        if len(prices) < period + 1:
+            return 50.0
+        deltas = np.diff(prices[-period-1:])
+        gains = np.where(deltas > 0, deltas, 0)
+        losses = np.where(deltas < 0, -deltas, 0)
+        avg_gain = np.mean(gains)
+        avg_loss = np.mean(losses)
+        if avg_loss == 0:
+            return 100.0
+        rs = avg_gain / avg_loss
+        return 100 - (100 / (1 + rs))
+
     def check_divergence(self, current_price):
-        prices_15m = [c['close'] for c in self.data.generate_candles(15, 30, current_price=current_price)]
+        prices_15m = [c['close'] for c in self.data.generate_candles(15, 30)]
         rsi = self.calculate_rsi(prices_15m)
         if prices_15m[-1] < prices_15m[-5] and rsi > self.calculate_rsi(prices_15m[:-5]):
             if rsi < self.adaptive.rsi_oversold:
@@ -187,7 +220,7 @@ class AdaptiveHighProbStrategy:
         return None
 
     def check_double_pattern(self, current_price):
-        candles = self.data.generate_candles(5, 50, current_price=current_price)
+        candles = self.data.generate_candles(5, 50)
         lows = [c['low'] for c in candles[-30:]]
         highs = [c['high'] for c in candles[-30:]]
         min1 = min(lows)
@@ -203,19 +236,6 @@ class AdaptiveHighProbStrategy:
         if abs(max1 - max2) / max1 < self.adaptive.double_pattern_tolerance and candles[-1]['close'] < max1 * 0.997:
             return "SELL"
         return None
-
-    def calculate_rsi(self, prices: list, period=14) -> float:
-        if len(prices) < period + 1:
-            return 50.0
-        deltas = np.diff(prices[-period-1:])
-        gains = np.where(deltas > 0, deltas, 0)
-        losses = np.where(deltas < 0, -deltas, 0)
-        avg_gain = np.mean(gains)
-        avg_loss = np.mean(losses)
-        if avg_loss == 0:
-            return 100.0
-        rs = avg_gain / avg_loss
-        return 100 - (100 / (1 + rs))
 
     def get_signal(self, current_price):
         self.adaptive.adapt_parameters()
@@ -234,6 +254,7 @@ class AdaptiveHighProbStrategy:
             return sig
         return None
 
+# ---------- Simulated Order Manager (no real orders) ----------
 class AdaptiveOrderManager:
     def __init__(self, data_client, adaptive_params):
         self.data = data_client
@@ -247,10 +268,8 @@ class AdaptiveOrderManager:
         self.cooldown_seconds = 300
         self.last_price_at_trade = 0.0
         self.min_price_change_pct = 0.003
-
-        # New exit parameters
-        self.trailing_stop_pct = 0.002   # 0.2% trail from highest price
-        self.profit_target_pct = 0.01    # 1% profit target
+        self.trailing_stop_pct = 0.002
+        self.profit_target_pct = 0.01
         self.highest_price = 0.0
 
     def can_enter(self, current_price) -> bool:
@@ -273,31 +292,23 @@ class AdaptiveOrderManager:
         self.entry_pattern = pattern
         self.last_trade_time = time.time()
         self.last_price_at_trade = price
-        # Initialize trailing stop tracking
         self.highest_price = price
         log.info(f"🔵 BUY {contracts} BTC (simulated) @ ${price:,.2f} (Pattern: {pattern})")
 
     def update_exit(self, current_price):
-        """Update trailing stop and check exit conditions. Returns True if should exit."""
+        """Return True if trailing stop or profit target is hit."""
         if self.position == 0:
             return False
-
-        # Update highest price seen since entry
         if current_price > self.highest_price:
             self.highest_price = current_price
-
-        # Profit target (1% from entry)
         profit_target = self.entry_price * (1 + self.profit_target_pct)
         if current_price >= profit_target:
             log.info(f"Profit target hit {self.profit_target_pct*100}%")
             return True
-
-        # Trailing stop (0.2% below highest price)
         trail_stop = self.highest_price * (1 - self.trailing_stop_pct)
         if current_price <= trail_stop:
             log.info(f"Trailing stop hit (high: {self.highest_price:.2f}, stop: {trail_stop:.2f})")
             return True
-
         return False
 
     def execute_sell(self, price: float, contracts: int = 1):
@@ -318,8 +329,9 @@ class AdaptiveOrderManager:
             self.execute_sell(price)
 
 def main():
-    log.info("Adaptive High Probability Bot – Cooldown + Trailing Stop + Profit Target")
-    data = RealCryptoData()
+    log.info("Adaptive High Probability Bot – Real Binance Data")
+    log.info("Trailing stop: 0.2% | Profit target: 1% | Cooldown: 5 min")
+    data = RealMarketData()
     adaptive = AdaptiveParams()
     strategy = AdaptiveHighProbStrategy(data, adaptive)
     orders = AdaptiveOrderManager(data, adaptive)
@@ -328,7 +340,7 @@ def main():
 
     try:
         while True:
-            price = data.get_last_price()
+            price = data.get_current_price()
             if orders.position == 0:
                 if orders.can_enter(price):
                     signal = strategy.get_signal(price)
@@ -338,7 +350,6 @@ def main():
                     if int(time.time()) % 60 < SCAN_SECONDS:
                         log.info(f"Cooldown or price stale – no entry. BTC: ${price:,.2f}")
             else:
-                # Check trailing stop and profit target every cycle
                 if orders.update_exit(price):
                     orders.execute_sell(price, CONTRACTS)
                 else:
@@ -348,7 +359,7 @@ def main():
     except KeyboardInterrupt:
         log.info("Shutting down – force closing any open position")
         if orders.position != 0:
-            orders.force_exit(data.get_last_price())
+            orders.force_exit(data.get_current_price())
 
 if __name__ == "__main__":
     main()
