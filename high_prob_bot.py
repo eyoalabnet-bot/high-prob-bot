@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-High Probability Trading Bot – Adaptive + Cooldown + Trailing Stop + Live Trading
-- Real Bitcoin data (KuCoin public API, fallback to simulated on rate limit)
-- Adaptive pattern selection (remembers across restarts)
-- Optional live trading on KuCoin (set LIVE_TRADING = True and add API keys)
-- Learning persistence – state saved to learning_state.json
-- Starting balance: $100 (simulated)
+High Probability Trading Bot – Coinbase Advanced Trade
+- Real Bitcoin data from Coinbase (public endpoints for candles/price)
+- Optional live trading on Coinbase Advanced Trade
+- Adaptive pattern selection, trailing stop, profit target
+- Paper trading by default (set LIVE_TRADING = True and add keys)
+- Starting simulated balance: $100
 """
 
 import time
@@ -13,15 +13,14 @@ import logging
 import json
 import os
 import hmac
-import base64
 import hashlib
+import base64
 import numpy as np
 import requests
 import random
-from datetime import datetime
+from datetime import datetime, timezone
 from urllib.parse import urlencode
 
-# ---------- Setup ----------
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -29,60 +28,62 @@ logging.basicConfig(
 )
 log = logging.getLogger("high_prob_bot")
 
-# ---------- Real Market Data from KuCoin (public) + fallback ----------
+
+# ---------- Real Market Data from Coinbase (Public) + Fallback ----------
 class RealMarketData:
-    def __init__(self, api_key=None, api_secret=None, api_passphrase=None):
-        self.kucoin_base = "https://api.kucoin.com/api/v1"
-        self.symbol = "BTC-USDT"
+    def __init__(self, api_key=None, api_secret=None, passphrase=None):
+        self.public_url = "https://api.exchange.coinbase.com"
+        self.auth_url = "https://api.exchange.coinbase.com"  # same for authenticated endpoints
+        self.product = "BTC-USD"
         self.cached_price = 50000.0
         self.last_price_fetch = 0
         self.price_cache_ttl = 5
-        self.kucoin_interval_map = {1: "1min", 5: "5min", 15: "15min", 60: "1hour", 240: "4hour", 1440: "1day"}
-        # For live trading
+        # For live trading (Coinbase Advanced Trade)
         self.api_key = api_key
         self.api_secret = api_secret
-        self.api_passphrase = api_passphrase
+        self.passphrase = passphrase
 
+    # ---------- Public endpoints (no key) ----------
     def get_current_price(self) -> float:
         now = time.time()
         if now - self.last_price_fetch < self.price_cache_ttl:
             return self.cached_price
         try:
-            url = f"{self.kucoin_base}/market/stats?symbol={self.symbol}"
-            response = requests.get(url, timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                if data.get("code") == "200000":
-                    self.cached_price = float(data["data"]["last"])
-                    self.last_price_fetch = now
-                    return self.cached_price
-            log.warning(f"KuCoin price returned {response.status_code}, using cached")
+            url = f"{self.public_url}/products/{self.product}/ticker"
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                self.cached_price = float(data["price"])
+                self.last_price_fetch = now
+                return self.cached_price
         except Exception as e:
-            log.warning(f"KuCoin price error: {e}, using cached")
-        return self.cached_price if self.cached_price else 50000.0
+            log.warning(f"Coinbase price error: {e}, using cached")
+        return self.cached_price
 
-    def get_historical_candles(self, interval: str, limit: int = 50) -> list:
+    def get_historical_candles(self, granularity: int, limit: int = 50) -> list:
+        """
+        Coinbase granularity in seconds: 60 (1m), 300 (5m), 900 (15m), 3600 (1h), 21600 (6h), 86400 (1d)
+        """
         try:
-            url = f"{self.kucoin_base}/market/candles"
-            params = {"symbol": self.symbol, "type": interval, "limit": limit}
-            response = requests.get(url, params=params, timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                if data.get("code") == "200000" and data.get("data"):
-                    candles = []
-                    for item in data["data"]:
-                        candles.append({
-                            "timestamp": int(item[0]),
-                            "open": float(item[1]),
-                            "high": float(item[2]),
-                            "low": float(item[3]),
-                            "close": float(item[4]),
-                            "volume": float(item[5])
-                        })
-                    return candles
-            log.warning(f"KuCoin candles returned {response.status_code}, using fallback")
+            url = f"{self.public_url}/products/{self.product}/candles"
+            params = {"granularity": granularity, "limit": limit}
+            resp = requests.get(url, params=params, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                candles = []
+                # Coinbase returns: [time, low, high, open, close, volume]
+                for item in data:
+                    candles.append({
+                        "timestamp": item[0],
+                        "open": float(item[3]),
+                        "high": float(item[2]),
+                        "low": float(item[1]),
+                        "close": float(item[4]),
+                        "volume": float(item[5])
+                    })
+                return candles
         except Exception as e:
-            log.warning(f"KuCoin candles error: {e}, using fallback")
+            log.warning(f"Coinbase candles error: {e}, using fallback")
         return self._generate_simulated_candles(limit)
 
     def _generate_simulated_candles(self, count: int) -> list:
@@ -106,58 +107,80 @@ class RealMarketData:
         return candles
 
     def get_previous_session_close(self) -> float:
-        candles = self.get_historical_candles("1hour", 2)
+        candles = self.get_historical_candles(3600, 2)  # 1h
         if len(candles) >= 2:
             return candles[-2]["close"]
         return self.get_current_price() * 0.98
 
     def generate_candles(self, timeframe_min: int, count: int) -> list:
-        if timeframe_min not in self.kucoin_interval_map:
+        # Map minutes to Coinbase granularity (seconds)
+        granularity_map = {
+            1: 60, 5: 300, 15: 900, 60: 3600, 240: 14400, 1440: 86400
+        }
+        if timeframe_min not in granularity_map:
             raise ValueError(f"Unsupported timeframe {timeframe_min}")
-        interval = self.kucoin_interval_map[timeframe_min]
-        return self.get_historical_candles(interval, count)
+        granularity = granularity_map[timeframe_min]
+        return self.get_historical_candles(granularity, count)
 
-    # ---------- Live order placement (KuCoin) ----------
-    def place_order(self, side: str, size: float, price=None):
+    # ---------- Live order placement (Coinbase Advanced Trade) ----------
+    def _generate_signature(self, method, path, body=""):
+        timestamp = str(int(time.time()))
+        message = timestamp + method + path + body
+        signature = base64.b64encode(
+            hmac.new(self.api_secret.encode('utf-8'), message.encode('utf-8'), hashlib.sha256).digest()
+        ).decode('utf-8')
+        return timestamp, signature
+
+    def _request(self, method, path, body=None):
         if not self.api_key or not self.api_secret:
             log.error("API keys missing – cannot place real order")
             return None
-        endpoint = "/api/v1/orders"
-        url = "https://api.kucoin.com" + endpoint
+        url = self.auth_url + path
+        body_str = json.dumps(body) if body else ""
+        timestamp, signature = self._generate_signature(method, path, body_str)
+        headers = {
+            "CB-ACCESS-KEY": self.api_key,
+            "CB-ACCESS-SIGN": signature,
+            "CB-ACCESS-TIMESTAMP": timestamp,
+            "CB-ACCESS-PASSPHRASE": self.passphrase,
+            "Content-Type": "application/json"
+        }
+        try:
+            resp = requests.request(method, url, headers=headers, data=body_str, timeout=10)
+            if resp.status_code in [200, 201]:
+                return resp.json()
+            else:
+                log.error(f"Coinbase API error {resp.status_code}: {resp.text}")
+        except Exception as e:
+            log.error(f"Order request error: {e}")
+        return None
+
+    def place_order(self, side: str, size: float, price=None):
+        """
+        side: 'buy' or 'sell'
+        size: amount of BTC (e.g., 0.001)
+        price: optional limit price (if None, market order)
+        """
+        order_type = "market" if price is None else "limit"
         body = {
-            "clientOid": str(int(time.time() * 1000)),
+            "product_id": self.product,
             "side": side,
-            "symbol": "BTC-USDT",
-            "type": "market" if price is None else "limit",
-            "size": str(size)
+            "size": str(size),
+            "type": order_type
         }
         if price:
             body["price"] = str(price)
-        now = str(int(time.time() * 1000))
-        str_to_sign = now + 'POST' + endpoint + json.dumps(body)
-        signature = base64.b64encode(
-            hmac.new(self.api_secret.encode('utf-8'), str_to_sign.encode('utf-8'), hashlib.sha256).digest()
-        ).decode('utf-8')
-        headers = {
-            "KC-API-KEY": self.api_key,
-            "KC-API-SIGN": signature,
-            "KC-API-TIMESTAMP": now,
-            "KC-API-PASSPHRASE": self.api_passphrase,
-            "KC-API-KEY-VERSION": "2"
-        }
-        try:
-            response = requests.post(url, json=body, headers=headers, timeout=10)
-            if response.status_code == 200:
-                log.info(f"✅ Live {side.upper()} order placed: {size} BTC")
-                return response.json()
-            else:
-                log.error(f"Order failed: {response.text}")
-        except Exception as e:
-            log.error(f"Order error: {e}")
-        return None
+        path = "/orders"
+        result = self._request("POST", path, body)
+        if result and "id" in result:
+            log.info(f"✅ Live {side.upper()} order placed: {size} BTC")
+            return result
+        else:
+            log.error(f"Live order failed: {result}")
+            return None
 
 
-# ---------- Adaptive Parameters with Persistence ----------
+# ---------- Adaptive Parameters with Persistence (unchanged) ----------
 class AdaptiveParams:
     def __init__(self, state_file="learning_state.json"):
         self.state_file = state_file
@@ -187,7 +210,6 @@ class AdaptiveParams:
         try:
             with open(self.state_file, "w") as f:
                 json.dump(state, f)
-            log.info("Learning state saved")
         except Exception as e:
             log.error(f"Failed to save learning state: {e}")
 
@@ -265,7 +287,7 @@ class AdaptiveParams:
         return np.random.choice(patterns, p=probs)
 
 
-# ---------- Strategy (unchanged) ----------
+# ---------- Strategy (unchanged from previous version) ----------
 class AdaptiveHighProbStrategy:
     def __init__(self, data_client, adaptive_params):
         self.data = data_client
@@ -378,7 +400,7 @@ class AdaptiveOrderManager:
         self.position = 0
         self.entry_price = 0.0
         self.entry_pattern = None
-        self.balance = 100.0               # <--- STARTING BALANCE $100
+        self.balance = 100.0               # simulated starting balance
         self.trades = []
         self.last_trade_time = 0
         self.cooldown_seconds = 300
@@ -387,7 +409,7 @@ class AdaptiveOrderManager:
         self.trailing_stop_pct = 0.002
         self.profit_target_pct = 0.01
         self.highest_price = 0.0
-        self.max_btc_size = 0.001          # ~$70 – adjust for $100 balance (e.g., 0.0007)
+        self.max_btc_size = 0.001          # ~$70 – adjust as needed
 
     def can_enter(self, current_price) -> bool:
         now = time.time()
@@ -406,7 +428,7 @@ class AdaptiveOrderManager:
             return
         if self.live_mode:
             result = self.data.place_order("buy", self.max_btc_size)
-            if result and result.get("code") == "200000":
+            if result and "id" in result:
                 self.position = 1
                 self.entry_price = price
                 self.entry_pattern = pattern
@@ -445,9 +467,9 @@ class AdaptiveOrderManager:
             return
         if self.live_mode:
             result = self.data.place_order("sell", self.max_btc_size)
-            if result and result.get("code") == "200000":
+            if result and "id" in result:
                 pnl = (price - self.entry_price) * self.max_btc_size
-                self.balance += pnl  # only for local tracking, not real balance
+                self.balance += pnl   # local tracking only
                 log.info(f"🔴 LIVE SELL {self.max_btc_size} BTC @ ${price:,.2f} | PnL: ${pnl:.2f}")
             else:
                 log.error("Live sell failed")
@@ -469,21 +491,20 @@ class AdaptiveOrderManager:
 
 # ---------- Main ----------
 def main():
-    log.info("===== High Probability Bot – Live Trading Ready (Starting Balance $100) =====")
+    log.info("===== High Probability Bot – Coinbase Advanced Trade =====")
 
-    # --- CONFIGURATION (change these) ---
-    LIVE_TRADING = False   # Set to True to enable real orders
-    SCAN_SECONDS = 30      # Increase to reduce API calls
+    # --- CONFIGURATION ---
+    LIVE_TRADING = False          # change to True to enable real orders
+    SCAN_SECONDS = 30
 
-    # Get KuCoin API keys from environment variables (for live trading)
-    api_key = os.environ.get("KUCOIN_API_KEY")
-    api_secret = os.environ.get("KUCOIN_API_SECRET")
-    api_passphrase = os.environ.get("KUCOIN_API_PASSPHRASE")
+    api_key = os.environ.get("COINBASE_API_KEY")
+    api_secret = os.environ.get("COINBASE_API_SECRET")
+    api_passphrase = os.environ.get("COINBASE_API_PASSPHRASE")
 
     adaptive = AdaptiveParams()
 
     if LIVE_TRADING and all([api_key, api_secret, api_passphrase]):
-        log.warning("⚠️ LIVE TRADING ENABLED – real orders will be placed on KuCoin")
+        log.warning("⚠️ LIVE TRADING ENABLED – real orders will be placed on Coinbase")
         data = RealMarketData(api_key, api_secret, api_passphrase)
         orders = AdaptiveOrderManager(data, adaptive, live_mode=True)
     else:
@@ -522,6 +543,7 @@ def main():
         if orders.position != 0:
             orders.force_exit(data.get_current_price())
         adaptive.save_state()
+
 
 if __name__ == "__main__":
     main()
