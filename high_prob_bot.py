@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
 """
-High Probability Trading Bot – Adaptive + Cooldown + Trailing Stop
-- Real Bitcoin price (KuCoin public API, no key)
-- Real 1m, 5m, 15m candles from KuCoin (no more fake patterns)
-- Learns which patterns work in current market
-- 5‑minute cooldown after each trade
-- Minimum price movement filter (0.3%)
-- Trailing stop (0.2% from highest price since entry)
-- Profit target (1% from entry price)
-- Simulated trading only – no real orders
-- Starting balance: $400
+High Probability Trading Bot – Adaptive + Cooldown + Trailing Stop + Live Trading
+- Real Bitcoin data (KuCoin public API, fallback to simulated on rate limit)
+- Adaptive pattern selection (remembers across restarts)
+- Optional live trading on KuCoin (set LIVE_TRADING = True and add API keys)
+- Learning persistence – state saved to learning_state.json
+- Starting balance: $100 (simulated)
 """
 
 import time
 import logging
+import json
+import os
+import hmac
+import base64
+import hashlib
 import numpy as np
 import requests
 import random
 from datetime import datetime
+from urllib.parse import urlencode
 
+# ---------- Setup ----------
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -26,25 +29,24 @@ logging.basicConfig(
 )
 log = logging.getLogger("high_prob_bot")
 
-# ---------- Real Market Data from KuCoin (Public API, No Key Required) ----------
+# ---------- Real Market Data from KuCoin (public) + fallback ----------
 class RealMarketData:
-    def __init__(self):
+    def __init__(self, api_key=None, api_secret=None, api_passphrase=None):
         self.kucoin_base = "https://api.kucoin.com/api/v1"
         self.symbol = "BTC-USDT"
         self.cached_price = 50000.0
         self.last_price_fetch = 0
-        self.price_cache_ttl = 5  # seconds
-        self.kucoin_interval_map = {
-            1: "1min", 5: "5min", 15: "15min", 60: "1hour",
-            240: "4hour", 1440: "1day"
-        }
+        self.price_cache_ttl = 5
+        self.kucoin_interval_map = {1: "1min", 5: "5min", 15: "15min", 60: "1hour", 240: "4hour", 1440: "1day"}
+        # For live trading
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.api_passphrase = api_passphrase
 
     def get_current_price(self) -> float:
-        """Get real-time BTC price from KuCoin public ticker endpoint."""
         now = time.time()
         if now - self.last_price_fetch < self.price_cache_ttl:
             return self.cached_price
-
         try:
             url = f"{self.kucoin_base}/market/stats?symbol={self.symbol}"
             response = requests.get(url, timeout=10)
@@ -57,21 +59,12 @@ class RealMarketData:
             log.warning(f"KuCoin price returned {response.status_code}, using cached")
         except Exception as e:
             log.warning(f"KuCoin price error: {e}, using cached")
-
         return self.cached_price if self.cached_price else 50000.0
 
     def get_historical_candles(self, interval: str, limit: int = 50) -> list:
-        """
-        Fetch real OHLCV candles from KuCoin's public API.
-        Returns list of candles with keys: timestamp, open, high, low, close, volume.
-        """
         try:
             url = f"{self.kucoin_base}/market/candles"
-            params = {
-                "symbol": self.symbol,
-                "type": interval,
-                "limit": limit
-            }
+            params = {"symbol": self.symbol, "type": interval, "limit": limit}
             response = requests.get(url, params=params, timeout=10)
             if response.status_code == 200:
                 data = response.json()
@@ -84,19 +77,15 @@ class RealMarketData:
                             "high": float(item[2]),
                             "low": float(item[3]),
                             "close": float(item[4]),
-                            "volume": float(item[5])  # volume is at index 5 in KuCoin response
+                            "volume": float(item[5])
                         })
                     return candles
             log.warning(f"KuCoin candles returned {response.status_code}, using fallback")
         except Exception as e:
             log.warning(f"KuCoin candles error: {e}, using fallback")
-
-        # Fallback to simulated candles
-        log.warning(f"Using simulated candles for {interval}")
         return self._generate_simulated_candles(limit)
 
     def _generate_simulated_candles(self, count: int) -> list:
-        """Generate realistic random candles based on current price."""
         current_price = self.get_current_price()
         candles = []
         price = current_price
@@ -117,26 +106,61 @@ class RealMarketData:
         return candles
 
     def get_previous_session_close(self) -> float:
-        """Return 1 hour close as previous session close."""
         candles = self.get_historical_candles("1hour", 2)
         if len(candles) >= 2:
             return candles[-2]["close"]
         return self.get_current_price() * 0.98
 
     def generate_candles(self, timeframe_min: int, count: int) -> list:
-        """
-        Fetch real KuCoin candles by timeframe (1,5,15,60,240,1440).
-        Falls back to simulated if API fails.
-        """
         if timeframe_min not in self.kucoin_interval_map:
             raise ValueError(f"Unsupported timeframe {timeframe_min}")
         interval = self.kucoin_interval_map[timeframe_min]
         return self.get_historical_candles(interval, count)
 
+    # ---------- Live order placement (KuCoin) ----------
+    def place_order(self, side: str, size: float, price=None):
+        if not self.api_key or not self.api_secret:
+            log.error("API keys missing – cannot place real order")
+            return None
+        endpoint = "/api/v1/orders"
+        url = "https://api.kucoin.com" + endpoint
+        body = {
+            "clientOid": str(int(time.time() * 1000)),
+            "side": side,
+            "symbol": "BTC-USDT",
+            "type": "market" if price is None else "limit",
+            "size": str(size)
+        }
+        if price:
+            body["price"] = str(price)
+        now = str(int(time.time() * 1000))
+        str_to_sign = now + 'POST' + endpoint + json.dumps(body)
+        signature = base64.b64encode(
+            hmac.new(self.api_secret.encode('utf-8'), str_to_sign.encode('utf-8'), hashlib.sha256).digest()
+        ).decode('utf-8')
+        headers = {
+            "KC-API-KEY": self.api_key,
+            "KC-API-SIGN": signature,
+            "KC-API-TIMESTAMP": now,
+            "KC-API-PASSPHRASE": self.api_passphrase,
+            "KC-API-KEY-VERSION": "2"
+        }
+        try:
+            response = requests.post(url, json=body, headers=headers, timeout=10)
+            if response.status_code == 200:
+                log.info(f"✅ Live {side.upper()} order placed: {size} BTC")
+                return response.json()
+            else:
+                log.error(f"Order failed: {response.text}")
+        except Exception as e:
+            log.error(f"Order error: {e}")
+        return None
 
-# ---------- Adaptive Strategy (unchanged, but safer) ----------
+
+# ---------- Adaptive Parameters with Persistence ----------
 class AdaptiveParams:
-    def __init__(self):
+    def __init__(self, state_file="learning_state.json"):
+        self.state_file = state_file
         self.pattern_weights = {'engulfing': 1.0, 'divergence': 1.0, 'double': 1.0}
         self.rsi_oversold = 30
         self.rsi_overbought = 70
@@ -147,6 +171,43 @@ class AdaptiveParams:
         self.recent_winrate = {p: 0.5 for p in self.pattern_weights}
         self.last_update_time = time.time()
         self.update_interval = 3600
+        self.load_state()
+
+    def save_state(self):
+        state = {
+            "pattern_weights": self.pattern_weights,
+            "win_counts": self.win_counts,
+            "total_counts": self.total_counts,
+            "recent_winrate": self.recent_winrate,
+            "rsi_oversold": self.rsi_oversold,
+            "rsi_overbought": self.rsi_overbought,
+            "volume_spike_factor": self.volume_spike_factor,
+            "double_pattern_tolerance": self.double_pattern_tolerance,
+        }
+        try:
+            with open(self.state_file, "w") as f:
+                json.dump(state, f)
+            log.info("Learning state saved")
+        except Exception as e:
+            log.error(f"Failed to save learning state: {e}")
+
+    def load_state(self):
+        try:
+            with open(self.state_file, "r") as f:
+                state = json.load(f)
+            self.pattern_weights = state["pattern_weights"]
+            self.win_counts = state["win_counts"]
+            self.total_counts = state["total_counts"]
+            self.recent_winrate = state["recent_winrate"]
+            self.rsi_oversold = state["rsi_oversold"]
+            self.rsi_overbought = state["rsi_overbought"]
+            self.volume_spike_factor = state["volume_spike_factor"]
+            self.double_pattern_tolerance = state["double_pattern_tolerance"]
+            log.info("Learning state loaded")
+        except FileNotFoundError:
+            log.info("No previous learning state found, starting fresh")
+        except Exception as e:
+            log.error(f"Error loading learning state: {e}")
 
     def record_trade_result(self, pattern_name: str, pnl: float):
         if pattern_name not in self.total_counts:
@@ -156,6 +217,7 @@ class AdaptiveParams:
             self.win_counts[pattern_name] += 1
         if self.total_counts[pattern_name] >= 5:
             self.recent_winrate[pattern_name] = self.win_counts[pattern_name] / self.total_counts[pattern_name]
+        self.save_state()
 
     def adapt_parameters(self):
         now = time.time()
@@ -188,6 +250,7 @@ class AdaptiveParams:
             self.double_pattern_tolerance = min(0.01, self.double_pattern_tolerance + 0.001)
 
         log.info(f"Adaptation: weights={self.pattern_weights}, RSI({self.rsi_oversold}/{self.rsi_overbought}), vol_spike={self.volume_spike_factor:.2f}, double_tol={self.double_pattern_tolerance:.4f}")
+        self.save_state()
 
     def choose_pattern(self) -> str:
         patterns = list(self.pattern_weights.keys())
@@ -202,6 +265,7 @@ class AdaptiveParams:
         return np.random.choice(patterns, p=probs)
 
 
+# ---------- Strategy (unchanged) ----------
 class AdaptiveHighProbStrategy:
     def __init__(self, data_client, adaptive_params):
         self.data = data_client
@@ -210,7 +274,7 @@ class AdaptiveHighProbStrategy:
         self.last_pattern_used = None
 
     def check_engulfing_with_volume(self, current_price):
-        candles = self.data.generate_candles(1, 5)  # 1-minute candles
+        candles = self.data.generate_candles(1, 5)
         if len(candles) < 2:
             return None
         prev_close = self.data.get_previous_session_close()
@@ -218,12 +282,10 @@ class AdaptiveHighProbStrategy:
         prev = candles[-2]
         avg_vol = np.mean([c['volume'] for c in candles[-5:]])
         vol_spike = last['volume'] > avg_vol * self.adaptive.volume_spike_factor
-        # Bullish engulfing
         if (prev['close'] < prev['open'] and last['close'] > last['open'] and
             last['close'] > prev['open'] and last['open'] < prev['close'] and
             last['low'] <= prev_close <= last['high'] and last['close'] > prev_close and vol_spike):
             return "BUY"
-        # Bearish engulfing
         elif (prev['close'] > prev['open'] and last['close'] < last['open'] and
               last['close'] < prev['open'] and last['open'] > prev['close'] and
               last['high'] >= prev_close >= last['low'] and last['close'] < prev_close and vol_spike):
@@ -307,23 +369,25 @@ class AdaptiveHighProbStrategy:
         return None
 
 
-# ---------- Simulated Order Manager (no real orders) ----------
+# ---------- Order Manager (Simulated + Live) – Starting balance $100 ----------
 class AdaptiveOrderManager:
-    def __init__(self, data_client, adaptive_params):
+    def __init__(self, data_client, adaptive_params, live_mode=False):
         self.data = data_client
         self.adaptive = adaptive_params
+        self.live_mode = live_mode
         self.position = 0
         self.entry_price = 0.0
         self.entry_pattern = None
-        self.balance = 400.0
+        self.balance = 100.0               # <--- STARTING BALANCE $100
         self.trades = []
         self.last_trade_time = 0
-        self.cooldown_seconds = 300  # 5 minutes
+        self.cooldown_seconds = 300
         self.last_price_at_trade = 0.0
         self.min_price_change_pct = 0.003
         self.trailing_stop_pct = 0.002
         self.profit_target_pct = 0.01
         self.highest_price = 0.0
+        self.max_btc_size = 0.001          # ~$70 – adjust for $100 balance (e.g., 0.0007)
 
     def can_enter(self, current_price) -> bool:
         now = time.time()
@@ -340,16 +404,28 @@ class AdaptiveOrderManager:
     def execute_buy(self, price: float, pattern: str, contracts: int = 1):
         if not self.can_enter(price):
             return
-        self.position = contracts
-        self.entry_price = price
-        self.entry_pattern = pattern
-        self.last_trade_time = time.time()
-        self.last_price_at_trade = price
-        self.highest_price = price
-        log.info(f"🔵 BUY {contracts} BTC (simulated) @ ${price:,.2f} (Pattern: {pattern})")
+        if self.live_mode:
+            result = self.data.place_order("buy", self.max_btc_size)
+            if result and result.get("code") == "200000":
+                self.position = 1
+                self.entry_price = price
+                self.entry_pattern = pattern
+                self.last_trade_time = time.time()
+                self.last_price_at_trade = price
+                self.highest_price = price
+                log.info(f"🔵 LIVE BUY {self.max_btc_size} BTC @ ${price:,.2f} (Pattern: {pattern})")
+            else:
+                log.error("Live buy failed, not entering simulated position")
+        else:
+            self.position = contracts
+            self.entry_price = price
+            self.entry_pattern = pattern
+            self.last_trade_time = time.time()
+            self.last_price_at_trade = price
+            self.highest_price = price
+            log.info(f"🔵 SIM BUY {contracts} BTC @ ${price:,.2f} (Pattern: {pattern})")
 
     def update_exit(self, current_price):
-        """Return True if trailing stop or profit target is hit."""
         if self.position == 0:
             return False
         if current_price > self.highest_price:
@@ -367,11 +443,20 @@ class AdaptiveOrderManager:
     def execute_sell(self, price: float, contracts: int = 1):
         if self.position == 0:
             return
-        pnl = (price - self.entry_price) * contracts
-        self.balance += pnl
-        self.trades.append({'price': price, 'pnl': pnl, 'pattern': self.entry_pattern})
-        self.adaptive.record_trade_result(self.entry_pattern, pnl)
-        log.info(f"🔴 SELL {contracts} BTC @ ${price:,.2f} | PnL: ${pnl:.2f} | Balance: ${self.balance:.2f} | Pattern: {self.entry_pattern}")
+        if self.live_mode:
+            result = self.data.place_order("sell", self.max_btc_size)
+            if result and result.get("code") == "200000":
+                pnl = (price - self.entry_price) * self.max_btc_size
+                self.balance += pnl  # only for local tracking, not real balance
+                log.info(f"🔴 LIVE SELL {self.max_btc_size} BTC @ ${price:,.2f} | PnL: ${pnl:.2f}")
+            else:
+                log.error("Live sell failed")
+        else:
+            pnl = (price - self.entry_price) * contracts
+            self.balance += pnl
+            self.trades.append({'price': price, 'pnl': pnl, 'pattern': self.entry_pattern})
+            self.adaptive.record_trade_result(self.entry_pattern, pnl)
+            log.info(f"🔴 SIM SELL {contracts} BTC @ ${price:,.2f} | PnL: ${pnl:.2f} | Balance: ${self.balance:.2f} | Pattern: {self.entry_pattern}")
         self.position = 0
         self.entry_price = 0.0
         self.entry_pattern = None
@@ -382,16 +467,37 @@ class AdaptiveOrderManager:
             self.execute_sell(price)
 
 
-# ---------- Main Loop ----------
+# ---------- Main ----------
 def main():
-    log.info("Adaptive High Probability Bot – Real KuCoin Data + Fallback")
-    log.info("Trailing stop: 0.2% | Profit target: 1% | Cooldown: 5 min")
-    data = RealMarketData()
+    log.info("===== High Probability Bot – Live Trading Ready (Starting Balance $100) =====")
+
+    # --- CONFIGURATION (change these) ---
+    LIVE_TRADING = False   # Set to True to enable real orders
+    SCAN_SECONDS = 30      # Increase to reduce API calls
+
+    # Get KuCoin API keys from environment variables (for live trading)
+    api_key = os.environ.get("KUCOIN_API_KEY")
+    api_secret = os.environ.get("KUCOIN_API_SECRET")
+    api_passphrase = os.environ.get("KUCOIN_API_PASSPHRASE")
+
     adaptive = AdaptiveParams()
+
+    if LIVE_TRADING and all([api_key, api_secret, api_passphrase]):
+        log.warning("⚠️ LIVE TRADING ENABLED – real orders will be placed on KuCoin")
+        data = RealMarketData(api_key, api_secret, api_passphrase)
+        orders = AdaptiveOrderManager(data, adaptive, live_mode=True)
+    else:
+        if LIVE_TRADING and not all([api_key, api_secret, api_passphrase]):
+            log.error("LIVE_TRADING is True but API keys missing. Falling back to paper trading.")
+        log.info("🔒 PAPER TRADING MODE – no real orders")
+        data = RealMarketData()
+        orders = AdaptiveOrderManager(data, adaptive, live_mode=False)
+
     strategy = AdaptiveHighProbStrategy(data, adaptive)
-    orders = AdaptiveOrderManager(data, adaptive)
     CONTRACTS = 1
-    SCAN_SECONDS = 15
+
+    log.info(f"Trailing stop: {orders.trailing_stop_pct*100}% | Profit target: {orders.profit_target_pct*100}% | Cooldown: {orders.cooldown_seconds}s")
+    log.info(f"Scan interval: {SCAN_SECONDS}s")
 
     try:
         while True:
@@ -415,6 +521,7 @@ def main():
         log.info("Shutting down – closing position")
         if orders.position != 0:
             orders.force_exit(data.get_current_price())
+        adaptive.save_state()
 
 if __name__ == "__main__":
     main()

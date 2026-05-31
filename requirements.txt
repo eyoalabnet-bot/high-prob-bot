@@ -1,2 +1,3 @@
-numpy
+knumpy
 requests
+python-dotenv
