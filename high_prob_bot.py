@@ -5,6 +5,7 @@ High Probability Trading Bot – Coinbase Advanced Trade (JWT, no passphrase)
 - Optional live trading (set LIVE_TRADING = True and add API keys)
 - Adaptive pattern selection, trailing stop, profit target
 - Paper trading by default, simulated balance $100
+- Real position size: 0.0005 BTC (~$35) – safe for a $100 account
 """
 
 import time
@@ -133,7 +134,7 @@ class RealMarketData:
         if self.coinbase:
             price = self.coinbase.get_current_price()
         if price is None:
-            # fallback to simulated
+            # fallback to small random walk (rare)
             price = self.cached_price * (1 + random.uniform(-0.001, 0.001))
         self.cached_price = price
         self.last_price_fetch = now
@@ -144,7 +145,6 @@ class RealMarketData:
         if self.coinbase:
             candles = self.coinbase.get_historical_candles(granularity, limit)
         if not candles:
-            # fallback to simulated
             candles = self._generate_simulated_candles(limit)
         return candles
 
@@ -399,7 +399,7 @@ class AdaptiveHighProbStrategy:
         return None
 
 
-# ---------- Order Manager (Simulated + Live) ----------
+# ---------- Order Manager (Simulated + Live) – Position size 0.0005 BTC for $100 account ----------
 class AdaptiveOrderManager:
     def __init__(self, data_client, adaptive_params, live_mode=False):
         self.data = data_client
@@ -408,7 +408,7 @@ class AdaptiveOrderManager:
         self.position = 0
         self.entry_price = 0.0
         self.entry_pattern = None
-        self.balance = 100.0
+        self.balance = 100.0               # simulated starting balance
         self.trades = []
         self.last_trade_time = 0
         self.cooldown_seconds = 300
@@ -417,7 +417,7 @@ class AdaptiveOrderManager:
         self.trailing_stop_pct = 0.002
         self.profit_target_pct = 0.01
         self.highest_price = 0.0
-        self.max_btc_size = 0.001
+        self.max_btc_size = 0.0005         # ~$35 per trade – safe for $100 account
 
     def can_enter(self, current_price) -> bool:
         now = time.time()
@@ -477,7 +477,7 @@ class AdaptiveOrderManager:
             result = self.data.place_order("sell", self.max_btc_size)
             if result and "order_id" in result:
                 pnl = (price - self.entry_price) * self.max_btc_size
-                self.balance += pnl
+                self.balance += pnl   # local tracking only
                 log.info(f"🔴 LIVE SELL {self.max_btc_size} BTC @ ${price:,.2f} | PnL: ${pnl:.2f}")
             else:
                 log.error("Live sell failed")
@@ -500,6 +500,7 @@ class AdaptiveOrderManager:
 # ---------- Main ----------
 def main():
     log.info("===== High Probability Bot – Coinbase Advanced Trade (JWT) =====")
+    log.info("Position size: 0.0005 BTC per trade (≈ $35 at current prices)")
 
     # --- CONFIGURATION ---
     LIVE_TRADING = False          # set to True to enable real orders
