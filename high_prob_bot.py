@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 High Probability Trading Bot – Coinbase Advanced Trade (JWT)
-- Full bot logic (trend filter, ATR stop, partial profit, daily loss limit)
-- Paper trading uses the SAME small position size as live (0.0005 BTC)
-- Prevents blowing a small simulated account
+- Fixed PEM newline issue (replaces literal \n with real newlines)
+- Requires cryptography package (see requirements.txt)
+- Paper trading uses 0.0005 BTC position size (safe for $100 account)
 """
 
 import time
@@ -23,9 +23,12 @@ logging.basicConfig(
 )
 log = logging.getLogger("high_prob_bot")
 
-# ---------- Coinbase API with JWT ----------
+# ---------- Coinbase API with JWT (fixed newline handling) ----------
 class CoinbaseClient:
     def __init__(self, api_key, api_secret, use_sandbox=False):
+        # Fix: replace literal '\n' strings with actual newlines
+        if '\\n' in api_secret:
+            api_secret = api_secret.replace('\\n', '\n')
         self.api_key = api_key
         self.api_secret = api_secret
         self.base_url = "https://api.coinbase.com" if not use_sandbox else "https://api-public.sandbox.exchange.coinbase.com"
@@ -180,7 +183,7 @@ class RealMarketData:
         return self.coinbase.place_order(side, size, price)
 
 
-# ---------- Adaptive Parameters ----------
+# ---------- Adaptive Parameters (with persistence) ----------
 class AdaptiveParams:
     def __init__(self, state_file="learning_state.json"):
         self.state_file = state_file
@@ -287,7 +290,7 @@ class AdaptiveParams:
         return np.random.choice(patterns, p=probs)
 
 
-# ---------- Strategy ----------
+# ---------- Strategy (trend filter, pattern detection) ----------
 class AdaptiveHighProbStrategy:
     def __init__(self, data_client, adaptive_params):
         self.data = data_client
@@ -409,7 +412,7 @@ class AdaptiveHighProbStrategy:
         return None
 
 
-# ---------- Order Manager (same small size for paper and live) ----------
+# ---------- Order Manager (small position size, same for paper & live) ----------
 class AdaptiveOrderManager:
     def __init__(self, data_client, adaptive_params, live_mode=False):
         self.data = data_client
@@ -426,10 +429,10 @@ class AdaptiveOrderManager:
         self.last_price_at_trade = 0.0
         self.min_price_change_pct = 0.003
         self.stop_loss_pct = 0.01          # 1% hard stop
-        self.partial_profit_pct = 0.015    # 1.5% partial profit
+        self.partial_profit_pct = 0.015    # 1.5% partial
         self.highest_price = 0.0
 
-        # UNIFIED POSITION SIZE (same for paper and live)
+        # UNIFIED POSITION SIZE (safe for $100 account)
         self.position_size_btc = 0.0005    # ≈ $25 at 50k BTC
 
         self.partial_taken = False
@@ -599,7 +602,7 @@ def main():
     api_secret = os.environ.get("COINBASE_API_SECRET")
     log.info(f"🔑 API keys present? Key: {bool(api_key)}, Secret: {bool(api_secret)}")
 
-    # --- Validate the keys ---
+    # --- Validate the keys (includes newline fix) ---
     keys_valid = False
     if api_key and api_secret:
         try:
