@@ -4,6 +4,7 @@ High Probability Trading Bot – Coinbase Advanced Trade (JWT, no passphrase)
 - Real Bitcoin data from Coinbase
 - Optional live trading (set LIVE_TRADING = True and add API keys)
 - Adaptive pattern selection, trailing stop, profit target
+- Daily loss limit: $35 (stops trading after losing $35 in a day)
 - Paper trading by default, simulated balance $100
 - Real position size: 0.0005 BTC (~$35) – safe for a $100 account
 """
@@ -16,7 +17,7 @@ import jwt
 import requests
 import numpy as np
 import random
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 logging.basicConfig(
     level=logging.INFO,
@@ -399,7 +400,7 @@ class AdaptiveHighProbStrategy:
         return None
 
 
-# ---------- Order Manager (Simulated + Live) – Position size 0.0005 BTC for $100 account ----------
+# ---------- Order Manager (Simulated + Live) – Daily loss limit $35 ----------
 class AdaptiveOrderManager:
     def __init__(self, data_client, adaptive_params, live_mode=False):
         self.data = data_client
@@ -419,7 +420,22 @@ class AdaptiveOrderManager:
         self.highest_price = 0.0
         self.max_btc_size = 0.0005         # ~$35 per trade – safe for $100 account
 
+        # Daily loss limit ($35)
+        self.daily_loss_limit = 35.0
+        self.daily_pnl = 0.0
+        self.last_reset_day = datetime.now(timezone.utc).date()
+
+    def _reset_daily_pnl_if_needed(self):
+        """Reset daily PnL at midnight UTC."""
+        today = datetime.now(timezone.utc).date()
+        if today != self.last_reset_day:
+            self.daily_pnl = 0.0
+            self.last_reset_day = today
+            log.info("Daily PnL reset to 0 (new trading day)")
+
     def can_enter(self, current_price) -> bool:
+        self._reset_daily_pnl_if_needed()
+
         now = time.time()
         if self.position != 0:
             return False
@@ -429,6 +445,12 @@ class AdaptiveOrderManager:
             pct_change = abs((current_price - self.last_price_at_trade) / self.last_price_at_trade)
             if pct_change < self.min_price_change_pct:
                 return False
+
+        # Daily loss limit check
+        if self.daily_pnl <= -self.daily_loss_limit:
+            log.warning(f"Daily loss limit reached (${-self.daily_pnl:.2f} lost). No more trades today.")
+            return False
+
         return True
 
     def execute_buy(self, price: float, pattern: str, contracts: int = 1):
@@ -478,15 +500,17 @@ class AdaptiveOrderManager:
             if result and "order_id" in result:
                 pnl = (price - self.entry_price) * self.max_btc_size
                 self.balance += pnl   # local tracking only
-                log.info(f"🔴 LIVE SELL {self.max_btc_size} BTC @ ${price:,.2f} | PnL: ${pnl:.2f}")
+                self.daily_pnl += pnl
+                log.info(f"🔴 LIVE SELL {self.max_btc_size} BTC @ ${price:,.2f} | PnL: ${pnl:.2f} | Daily PnL: ${self.daily_pnl:.2f}")
             else:
                 log.error("Live sell failed")
         else:
             pnl = (price - self.entry_price) * contracts
             self.balance += pnl
+            self.daily_pnl += pnl
             self.trades.append({'price': price, 'pnl': pnl, 'pattern': self.entry_pattern})
             self.adaptive.record_trade_result(self.entry_pattern, pnl)
-            log.info(f"🔴 SIM SELL {contracts} BTC @ ${price:,.2f} | PnL: ${pnl:.2f} | Balance: ${self.balance:.2f} | Pattern: {self.entry_pattern}")
+            log.info(f"🔴 SIM SELL {contracts} BTC @ ${price:,.2f} | PnL: ${pnl:.2f} | Balance: ${self.balance:.2f} | Daily PnL: ${self.daily_pnl:.2f} | Pattern: {self.entry_pattern}")
         self.position = 0
         self.entry_price = 0.0
         self.entry_pattern = None
@@ -501,6 +525,7 @@ class AdaptiveOrderManager:
 def main():
     log.info("===== High Probability Bot – Coinbase Advanced Trade (JWT) =====")
     log.info("Position size: 0.0005 BTC per trade (≈ $35 at current prices)")
+    log.info("Daily loss limit: $35 (trading stops after losing $35 in a day)")
 
     # --- CONFIGURATION ---
     LIVE_TRADING = False          # set to True to enable real orders
