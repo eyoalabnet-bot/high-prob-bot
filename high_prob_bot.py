@@ -2,7 +2,8 @@
 """
 High Probability Trading Bot – Coinbase Advanced Trade (JWT)
 - Full bot logic (trend filter, ATR stop, partial profit, daily loss limit)
-- Includes **API key validation** at startup (checks if keys are actually correct)
+- Paper trading uses the SAME small position size as live (0.0005 BTC)
+- Prevents blowing a small simulated account
 """
 
 import time
@@ -179,7 +180,7 @@ class RealMarketData:
         return self.coinbase.place_order(side, size, price)
 
 
-# ---------- Adaptive Parameters (with persistence) ----------
+# ---------- Adaptive Parameters ----------
 class AdaptiveParams:
     def __init__(self, state_file="learning_state.json"):
         self.state_file = state_file
@@ -286,7 +287,7 @@ class AdaptiveParams:
         return np.random.choice(patterns, p=probs)
 
 
-# ---------- Strategy (trend filter, pattern detection) ----------
+# ---------- Strategy ----------
 class AdaptiveHighProbStrategy:
     def __init__(self, data_client, adaptive_params):
         self.data = data_client
@@ -408,14 +409,14 @@ class AdaptiveHighProbStrategy:
         return None
 
 
-# ---------- Order Manager (stop-loss, partial profit, ATR trailing) ----------
+# ---------- Order Manager (same small size for paper and live) ----------
 class AdaptiveOrderManager:
     def __init__(self, data_client, adaptive_params, live_mode=False):
         self.data = data_client
         self.adaptive = adaptive_params
         self.live_mode = live_mode
-        self.position = 0
-        self.remaining_position = 0
+        self.position = 0.0
+        self.remaining_position = 0.0
         self.entry_price = 0.0
         self.entry_pattern = None
         self.balance = 100.0
@@ -424,14 +425,16 @@ class AdaptiveOrderManager:
         self.cooldown_seconds = 600
         self.last_price_at_trade = 0.0
         self.min_price_change_pct = 0.003
-        self.stop_loss_pct = 0.01
-        self.partial_profit_pct = 0.015
+        self.stop_loss_pct = 0.01          # 1% hard stop
+        self.partial_profit_pct = 0.015    # 1.5% partial profit
         self.highest_price = 0.0
-        self.max_btc_size = 0.0005
-        self.full_position_size = 1
+
+        # UNIFIED POSITION SIZE (same for paper and live)
+        self.position_size_btc = 0.0005    # ≈ $25 at 50k BTC
+
         self.partial_taken = False
 
-        self.daily_loss_limit_pct = 0.20
+        self.daily_loss_limit_pct = 0.20    # 20% of balance
         self.daily_pnl = 0.0
         self.last_reset_day = datetime.now(timezone.utc).date()
 
@@ -461,7 +464,7 @@ class AdaptiveOrderManager:
             log.critical("Account balance is ZERO or NEGATIVE – trading permanently halted.")
             return False
         now = time.time()
-        if self.position != 0:
+        if self.position != 0.0:
             return False
         if now - self.last_trade_time < self.cooldown_seconds:
             return False
@@ -475,59 +478,67 @@ class AdaptiveOrderManager:
             return False
         return True
 
-    def execute_buy(self, price: float, pattern: str, contracts: int = 1):
+    def execute_buy(self, price: float, pattern: str, size_override: float = None):
         if not self.can_enter(price):
             return
+        size = self.position_size_btc if size_override is None else size_override
         if self.live_mode:
-            result = self.data.place_order("buy", self.max_btc_size)
+            result = self.data.place_order("buy", size)
             if result and "order_id" in result:
-                self.position = 1
-                self.remaining_position = 1
+                self.position = size
+                self.remaining_position = size
                 self.entry_price = price
                 self.entry_pattern = pattern
                 self.last_trade_time = time.time()
                 self.last_price_at_trade = price
                 self.highest_price = price
                 self.partial_taken = False
-                self.full_position_size = self.max_btc_size
-                log.info(f"🔵 LIVE BUY {self.max_btc_size} BTC @ ${price:,.2f} (Pattern: {pattern})")
+                log.info(f"🔵 LIVE BUY {size:.4f} BTC @ ${price:,.2f} (Pattern: {pattern})")
             else:
                 log.error("Live buy failed")
         else:
-            self.position = contracts
-            self.remaining_position = contracts
+            self.position = size
+            self.remaining_position = size
             self.entry_price = price
             self.entry_pattern = pattern
             self.last_trade_time = time.time()
             self.last_price_at_trade = price
             self.highest_price = price
             self.partial_taken = False
-            self.full_position_size = contracts
-            log.info(f"🔵 SIM BUY {contracts} BTC @ ${price:,.2f} (Pattern: {pattern})")
+            log.info(f"🔵 SIM BUY {size:.4f} BTC @ ${price:,.2f} (Pattern: {pattern})")
 
     def update_exit(self, current_price):
-        if self.position == 0:
+        if self.position == 0.0:
             return False
+
+        # Hard stop-loss (1% from entry)
         stop_loss_price = self.entry_price * (1 - self.stop_loss_pct)
         if current_price <= stop_loss_price:
             log.info(f"🛑 Stop-loss hit (1% loss from entry ${self.entry_price:,.2f})")
             return True
+
+        # Update highest price
         if current_price > self.highest_price:
             self.highest_price = current_price
+
+        # Partial profit taking (1.5% profit)
         partial_target = self.entry_price * (1 + self.partial_profit_pct)
         if not self.partial_taken and current_price >= partial_target and self.remaining_position > 0:
             half_size = self.remaining_position / 2
-            if half_size >= 0.0001:
+            if half_size >= 0.00001:
                 self.remaining_position -= half_size
                 self.position = self.remaining_position
-                log.info(f"💰 Partial profit taken at +{self.partial_profit_pct*100}% – closed {half_size} BTC, remaining {self.remaining_position} BTC")
+                log.info(f"💰 Partial profit taken at +{self.partial_profit_pct*100}% – closed {half_size:.4f} BTC, remaining {self.remaining_position:.4f} BTC")
                 self._partial_sell(current_price, half_size)
                 self.partial_taken = True
+
+        # Dynamic trailing stop (1.5× ATR)
         atr = self.get_atr()
         trail_stop = self.highest_price - (atr * 1.5)
         if current_price <= trail_stop:
             log.info(f"🔻 Trailing stop hit (ATR={atr:.2f}, high: {self.highest_price:.2f}, stop: {trail_stop:.2f})")
             return True
+
         return False
 
     def _partial_sell(self, price: float, size: float):
@@ -537,7 +548,7 @@ class AdaptiveOrderManager:
                 pnl = (price - self.entry_price) * size
                 self.balance += pnl
                 self.daily_pnl += pnl
-                log.info(f"🔴 PARTIAL LIVE SELL {size} BTC @ ${price:,.2f} | PnL: ${pnl:.2f} | Daily PnL: ${self.daily_pnl:.2f}")
+                log.info(f"🔴 PARTIAL LIVE SELL {size:.4f} BTC @ ${price:,.2f} | PnL: ${pnl:.2f} | Daily PnL: ${self.daily_pnl:.2f}")
             else:
                 log.error("Partial live sell failed")
         else:
@@ -546,36 +557,36 @@ class AdaptiveOrderManager:
             self.daily_pnl += pnl
             self.trades.append({'price': price, 'pnl': pnl, 'pattern': self.entry_pattern, 'partial': True})
             self.adaptive.record_trade_result(self.entry_pattern, pnl)
-            log.info(f"🔴 PARTIAL SIM SELL {size} BTC @ ${price:,.2f} | PnL: ${pnl:.2f} | Balance: ${self.balance:.2f} | Daily PnL: ${self.daily_pnl:.2f}")
+            log.info(f"🔴 PARTIAL SIM SELL {size:.4f} BTC @ ${price:,.2f} | PnL: ${pnl:.2f} | Balance: ${self.balance:.2f} | Daily PnL: ${self.daily_pnl:.2f}")
 
-    def execute_sell(self, price: float, contracts: int = 1):
-        if self.position == 0:
+    def execute_sell(self, price: float):
+        if self.position == 0.0:
             return
-        size = self.remaining_position if not self.live_mode else self.max_btc_size
+        size = self.remaining_position
         if self.live_mode:
             result = self.data.place_order("sell", size)
             if result and "order_id" in result:
                 pnl = (price - self.entry_price) * size
                 self.balance += pnl
                 self.daily_pnl += pnl
-                log.info(f"🔴 LIVE SELL {size} BTC @ ${price:,.2f} | PnL: ${pnl:.2f} | Daily PnL: ${self.daily_pnl:.2f}")
+                log.info(f"🔴 LIVE SELL {size:.4f} BTC @ ${price:,.2f} | PnL: ${pnl:.2f} | Daily PnL: ${self.daily_pnl:.2f}")
             else:
                 log.error("Live sell failed")
         else:
-            pnl = (price - self.entry_price) * self.remaining_position
+            pnl = (price - self.entry_price) * size
             self.balance += pnl
             self.daily_pnl += pnl
             self.trades.append({'price': price, 'pnl': pnl, 'pattern': self.entry_pattern, 'full': True})
             self.adaptive.record_trade_result(self.entry_pattern, pnl)
-            log.info(f"🔴 SIM SELL {self.remaining_position} BTC @ ${price:,.2f} | PnL: ${pnl:.2f} | Balance: ${self.balance:.2f} | Daily PnL: ${self.daily_pnl:.2f} | Pattern: {self.entry_pattern}")
-        self.position = 0
-        self.remaining_position = 0
+            log.info(f"🔴 SIM SELL {size:.4f} BTC @ ${price:,.2f} | PnL: ${pnl:.2f} | Balance: ${self.balance:.2f} | Daily PnL: ${self.daily_pnl:.2f} | Pattern: {self.entry_pattern}")
+        self.position = 0.0
+        self.remaining_position = 0.0
         self.entry_price = 0.0
         self.entry_pattern = None
         self.highest_price = 0.0
 
     def force_exit(self, price):
-        if self.position != 0:
+        if self.position != 0.0:
             self.execute_sell(price)
 
 
@@ -588,13 +599,12 @@ def main():
     api_secret = os.environ.get("COINBASE_API_SECRET")
     log.info(f"🔑 API keys present? Key: {bool(api_key)}, Secret: {bool(api_secret)}")
 
-    # --- VALIDATE the keys by making an authenticated call ---
+    # --- Validate the keys ---
     keys_valid = False
     if api_key and api_secret:
         try:
             test_client = RealMarketData(api_key, api_secret)
             if test_client.coinbase:
-                # Try to fetch account list (requires valid credentials)
                 result = test_client.coinbase._request("GET", "/api/v3/brokerage/accounts")
                 if result and 'accounts' in result:
                     log.info("✅ API keys are VALID! Successfully fetched account data.")
@@ -608,7 +618,7 @@ def main():
     else:
         log.warning("⚠️ API keys missing – validation skipped.")
 
-    log.info("Position size: 0.0005 BTC per trade (≈ $35 at current prices)")
+    log.info(f"Position size: 0.0005 BTC per trade (≈ $25 at current prices)")
     log.info("Trend filter: 1h EMA(50) – trades only in direction of trend")
     log.info("Trailing stop: 1.5× ATR (dynamic)")
     log.info("Partial profit: take 50% at +1.5% profit, then trail the rest")
@@ -632,7 +642,6 @@ def main():
         orders = AdaptiveOrderManager(data, adaptive, live_mode=False)
 
     strategy = AdaptiveHighProbStrategy(data, adaptive)
-    CONTRACTS = 1
 
     log.info(f"Hard stop-loss: {orders.stop_loss_pct*100}% | Partial profit: {orders.partial_profit_pct*100}% | ATR multiplier: 1.5")
     log.info(f"Cooldown: {orders.cooldown_seconds}s | Scan interval: {SCAN_SECONDS}s")
@@ -640,17 +649,17 @@ def main():
     try:
         while True:
             price = data.get_current_price()
-            if orders.position == 0:
+            if orders.position == 0.0:
                 if orders.can_enter(price):
                     signal = strategy.get_signal(price)
                     if signal == "BUY":
-                        orders.execute_buy(price, strategy.last_pattern_used, CONTRACTS)
+                        orders.execute_buy(price, strategy.last_pattern_used)
                 else:
                     if int(time.time()) % 60 < SCAN_SECONDS:
                         log.info(f"⏳ Cooldown or price stale – no entry. BTC: ${price:,.2f}")
             else:
                 if orders.update_exit(price):
-                    orders.execute_sell(price, CONTRACTS)
+                    orders.execute_sell(price)
                 else:
                     if int(time.time()) % 30 < SCAN_SECONDS:
                         atr = orders.get_atr()
@@ -658,7 +667,7 @@ def main():
             time.sleep(SCAN_SECONDS)
     except KeyboardInterrupt:
         log.info("Shutting down – closing position")
-        if orders.position != 0:
+        if orders.position != 0.0:
             orders.force_exit(data.get_current_price())
         adaptive.save_state()
 
