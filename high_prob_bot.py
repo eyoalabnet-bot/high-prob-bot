@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-High Probability Trading Bot – Coinbase Advanced Trade (JWT)
-- Fixed PEM newline issue (replaces literal \n with real newlines)
-- Requires cryptography package (see requirements.txt)
-- Paper trading uses 0.0005 BTC position size (safe for $100 account)
+High Probability Trading Bot – Coinbase Advanced Trade (Paper Trading Mode)
+- Real Bitcoin data from Coinbase (public endpoints)
+- Simulated trading only – no real orders (LIVE_TRADING = False)
+- Uses 0.0005 BTC position size (~$25 at 50k BTC)
+- Includes trend filter (1h EMA), ATR trailing stop, partial profit taking
+- Daily loss limit: 20% of balance (resets at UTC midnight)
+- No API keys required for paper trading
 """
 
 import time
@@ -23,18 +26,21 @@ logging.basicConfig(
 )
 log = logging.getLogger("high_prob_bot")
 
-# ---------- Coinbase API with JWT (fixed newline handling) ----------
+# ---------- Coinbase API (public data only, no keys needed for paper mode) ----------
 class CoinbaseClient:
-    def __init__(self, api_key, api_secret, use_sandbox=False):
-        # Fix: replace literal '\n' strings with actual newlines
-        if '\\n' in api_secret:
-            api_secret = api_secret.replace('\\n', '\n')
+    def __init__(self, api_key=None, api_secret=None, use_sandbox=False):
+        # API keys are optional – only needed for live trading
         self.api_key = api_key
         self.api_secret = api_secret
         self.base_url = "https://api.coinbase.com" if not use_sandbox else "https://api-public.sandbox.exchange.coinbase.com"
         self.product = "BTC-USD"
+        # Fix for newline issue (if keys are provided)
+        if self.api_secret and '\\n' in self.api_secret:
+            self.api_secret = self.api_secret.replace('\\n', '\n')
 
     def _generate_jwt(self, method, request_path, body=""):
+        if not self.api_key or not self.api_secret:
+            return None
         uri = f"{method} {request_path}"
         if body:
             uri += body
@@ -50,9 +56,14 @@ class CoinbaseClient:
         return token
 
     def _request(self, method, path, body=None):
+        if not self.api_key or not self.api_secret:
+            log.error("No API keys – cannot make authenticated request")
+            return None
         url = self.base_url + path
         body_str = json.dumps(body) if body else ""
         token = self._generate_jwt(method, path, body_str)
+        if not token:
+            return None
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json"
@@ -100,45 +111,32 @@ class CoinbaseClient:
         return []
 
     def place_order(self, side: str, size: float, price=None):
-        order_type = "MARKET" if price is None else "LIMIT"
-        body = {
-            "product_id": self.product,
-            "side": side.upper(),
-            "size": str(size),
-            "type": order_type
-        }
-        if price:
-            body["price"] = str(price)
-            body["time_in_force"] = "GTC"
-        return self._request("POST", "/api/v3/brokerage/orders", body)
+        log.error("place_order called but bot is in PAPER MODE – no real order placed")
+        return None
 
 
-# ---------- Market Data Wrapper ----------
+# ---------- Market Data Wrapper (uses public data only) ----------
 class RealMarketData:
     def __init__(self, api_key=None, api_secret=None):
-        self.coinbase = CoinbaseClient(api_key, api_secret) if api_key and api_secret else None
+        self.coinbase = CoinbaseClient(api_key, api_secret) if api_key and api_secret else CoinbaseClient()
         self.cached_price = 50000.0
         self.last_price_fetch = 0
         self.price_cache_ttl = 5
-        self.use_simulated_fallback = False
 
     def get_current_price(self) -> float:
         now = time.time()
         if now - self.last_price_fetch < self.price_cache_ttl:
             return self.cached_price
-        price = None
-        if self.coinbase:
-            price = self.coinbase.get_current_price()
+        price = self.coinbase.get_current_price()
         if price is None:
+            # Fallback to small random walk if API fails (rare)
             price = self.cached_price * (1 + random.uniform(-0.001, 0.001))
         self.cached_price = price
         self.last_price_fetch = now
         return price
 
     def get_historical_candles(self, granularity: int, limit: int = 50) -> list:
-        candles = []
-        if self.coinbase:
-            candles = self.coinbase.get_historical_candles(granularity, limit)
+        candles = self.coinbase.get_historical_candles(granularity, limit)
         if not candles:
             candles = self._generate_simulated_candles(limit)
         return candles
@@ -177,9 +175,6 @@ class RealMarketData:
         return self.get_historical_candles(granularity, count)
 
     def place_order(self, side: str, size: float, price=None):
-        if not self.coinbase:
-            log.error("No Coinbase client – cannot place real order")
-            return None
         return self.coinbase.place_order(side, size, price)
 
 
@@ -290,7 +285,7 @@ class AdaptiveParams:
         return np.random.choice(patterns, p=probs)
 
 
-# ---------- Strategy (trend filter, pattern detection) ----------
+# ---------- Strategy (trend filter + pattern detection) ----------
 class AdaptiveHighProbStrategy:
     def __init__(self, data_client, adaptive_params):
         self.data = data_client
@@ -412,7 +407,7 @@ class AdaptiveHighProbStrategy:
         return None
 
 
-# ---------- Order Manager (small position size, same for paper & live) ----------
+# ---------- Order Manager (Paper Trading Only) ----------
 class AdaptiveOrderManager:
     def __init__(self, data_client, adaptive_params, live_mode=False):
         self.data = data_client
@@ -431,10 +426,7 @@ class AdaptiveOrderManager:
         self.stop_loss_pct = 0.01          # 1% hard stop
         self.partial_profit_pct = 0.015    # 1.5% partial
         self.highest_price = 0.0
-
-        # UNIFIED POSITION SIZE (safe for $100 account)
-        self.position_size_btc = 0.0005    # ≈ $25 at 50k BTC
-
+        self.position_size_btc = 0.0005    # safe for $100 account (~$25 at 50k BTC)
         self.partial_taken = False
 
         self.daily_loss_limit_pct = 0.20    # 20% of balance
@@ -481,24 +473,13 @@ class AdaptiveOrderManager:
             return False
         return True
 
-    def execute_buy(self, price: float, pattern: str, size_override: float = None):
+    def execute_buy(self, price: float, pattern: str):
         if not self.can_enter(price):
             return
-        size = self.position_size_btc if size_override is None else size_override
+        size = self.position_size_btc
         if self.live_mode:
-            result = self.data.place_order("buy", size)
-            if result and "order_id" in result:
-                self.position = size
-                self.remaining_position = size
-                self.entry_price = price
-                self.entry_pattern = pattern
-                self.last_trade_time = time.time()
-                self.last_price_at_trade = price
-                self.highest_price = price
-                self.partial_taken = False
-                log.info(f"🔵 LIVE BUY {size:.4f} BTC @ ${price:,.2f} (Pattern: {pattern})")
-            else:
-                log.error("Live buy failed")
+            log.error("Live trading disabled – bot is in PAPER MODE")
+            return
         else:
             self.position = size
             self.remaining_position = size
@@ -513,18 +494,12 @@ class AdaptiveOrderManager:
     def update_exit(self, current_price):
         if self.position == 0.0:
             return False
-
-        # Hard stop-loss (1% from entry)
         stop_loss_price = self.entry_price * (1 - self.stop_loss_pct)
         if current_price <= stop_loss_price:
             log.info(f"🛑 Stop-loss hit (1% loss from entry ${self.entry_price:,.2f})")
             return True
-
-        # Update highest price
         if current_price > self.highest_price:
             self.highest_price = current_price
-
-        # Partial profit taking (1.5% profit)
         partial_target = self.entry_price * (1 + self.partial_profit_pct)
         if not self.partial_taken and current_price >= partial_target and self.remaining_position > 0:
             half_size = self.remaining_position / 2
@@ -534,54 +509,31 @@ class AdaptiveOrderManager:
                 log.info(f"💰 Partial profit taken at +{self.partial_profit_pct*100}% – closed {half_size:.4f} BTC, remaining {self.remaining_position:.4f} BTC")
                 self._partial_sell(current_price, half_size)
                 self.partial_taken = True
-
-        # Dynamic trailing stop (1.5× ATR)
         atr = self.get_atr()
         trail_stop = self.highest_price - (atr * 1.5)
         if current_price <= trail_stop:
             log.info(f"🔻 Trailing stop hit (ATR={atr:.2f}, high: {self.highest_price:.2f}, stop: {trail_stop:.2f})")
             return True
-
         return False
 
     def _partial_sell(self, price: float, size: float):
-        if self.live_mode:
-            result = self.data.place_order("sell", size)
-            if result and "order_id" in result:
-                pnl = (price - self.entry_price) * size
-                self.balance += pnl
-                self.daily_pnl += pnl
-                log.info(f"🔴 PARTIAL LIVE SELL {size:.4f} BTC @ ${price:,.2f} | PnL: ${pnl:.2f} | Daily PnL: ${self.daily_pnl:.2f}")
-            else:
-                log.error("Partial live sell failed")
-        else:
-            pnl = (price - self.entry_price) * size
-            self.balance += pnl
-            self.daily_pnl += pnl
-            self.trades.append({'price': price, 'pnl': pnl, 'pattern': self.entry_pattern, 'partial': True})
-            self.adaptive.record_trade_result(self.entry_pattern, pnl)
-            log.info(f"🔴 PARTIAL SIM SELL {size:.4f} BTC @ ${price:,.2f} | PnL: ${pnl:.2f} | Balance: ${self.balance:.2f} | Daily PnL: ${self.daily_pnl:.2f}")
+        pnl = (price - self.entry_price) * size
+        self.balance += pnl
+        self.daily_pnl += pnl
+        self.trades.append({'price': price, 'pnl': pnl, 'pattern': self.entry_pattern, 'partial': True})
+        self.adaptive.record_trade_result(self.entry_pattern, pnl)
+        log.info(f"🔴 PARTIAL SIM SELL {size:.4f} BTC @ ${price:,.2f} | PnL: ${pnl:.2f} | Balance: ${self.balance:.2f} | Daily PnL: ${self.daily_pnl:.2f}")
 
     def execute_sell(self, price: float):
         if self.position == 0.0:
             return
         size = self.remaining_position
-        if self.live_mode:
-            result = self.data.place_order("sell", size)
-            if result and "order_id" in result:
-                pnl = (price - self.entry_price) * size
-                self.balance += pnl
-                self.daily_pnl += pnl
-                log.info(f"🔴 LIVE SELL {size:.4f} BTC @ ${price:,.2f} | PnL: ${pnl:.2f} | Daily PnL: ${self.daily_pnl:.2f}")
-            else:
-                log.error("Live sell failed")
-        else:
-            pnl = (price - self.entry_price) * size
-            self.balance += pnl
-            self.daily_pnl += pnl
-            self.trades.append({'price': price, 'pnl': pnl, 'pattern': self.entry_pattern, 'full': True})
-            self.adaptive.record_trade_result(self.entry_pattern, pnl)
-            log.info(f"🔴 SIM SELL {size:.4f} BTC @ ${price:,.2f} | PnL: ${pnl:.2f} | Balance: ${self.balance:.2f} | Daily PnL: ${self.daily_pnl:.2f} | Pattern: {self.entry_pattern}")
+        pnl = (price - self.entry_price) * size
+        self.balance += pnl
+        self.daily_pnl += pnl
+        self.trades.append({'price': price, 'pnl': pnl, 'pattern': self.entry_pattern, 'full': True})
+        self.adaptive.record_trade_result(self.entry_pattern, pnl)
+        log.info(f"🔴 SIM SELL {size:.4f} BTC @ ${price:,.2f} | PnL: ${pnl:.2f} | Balance: ${self.balance:.2f} | Daily PnL: ${self.daily_pnl:.2f} | Pattern: {self.entry_pattern}")
         self.position = 0.0
         self.remaining_position = 0.0
         self.entry_price = 0.0
@@ -595,55 +547,19 @@ class AdaptiveOrderManager:
 
 # ---------- Main ----------
 def main():
-    log.info("===== High Probability Bot – Coinbase Advanced Trade (JWT) =====")
-
-    # --- API key presence check ---
-    api_key = os.environ.get("COINBASE_API_KEY")
-    api_secret = os.environ.get("COINBASE_API_SECRET")
-    log.info(f"🔑 API keys present? Key: {bool(api_key)}, Secret: {bool(api_secret)}")
-
-    # --- Validate the keys (includes newline fix) ---
-    keys_valid = False
-    if api_key and api_secret:
-        try:
-            test_client = RealMarketData(api_key, api_secret)
-            if test_client.coinbase:
-                result = test_client.coinbase._request("GET", "/api/v3/brokerage/accounts")
-                if result and 'accounts' in result:
-                    log.info("✅ API keys are VALID! Successfully fetched account data.")
-                    keys_valid = True
-                else:
-                    log.error("❌ API keys appear INVALID – check permissions or key format.")
-            else:
-                log.error("❌ Failed to create Coinbase client.")
-        except Exception as e:
-            log.error(f"❌ API validation failed: {e}")
-    else:
-        log.warning("⚠️ API keys missing – validation skipped.")
-
-    log.info(f"Position size: 0.0005 BTC per trade (≈ $25 at current prices)")
+    log.info("===== High Probability Bot – PAPER TRADING MODE (no real orders) =====")
+    log.info("Position size: 0.0005 BTC per trade (≈ $25 at current prices)")
     log.info("Trend filter: 1h EMA(50) – trades only in direction of trend")
     log.info("Trailing stop: 1.5× ATR (dynamic)")
     log.info("Partial profit: take 50% at +1.5% profit, then trail the rest")
-    log.info("Daily loss limit: 20% of current balance")
-    log.info("Balance floor: bot stops trading if simulated balance <= $0")
+    log.info("Daily loss limit: 20% of current balance (resets at UTC midnight)")
 
-    LIVE_TRADING = False          # set to True to enable real orders
+    LIVE_TRADING = False          # PAPER MODE – no real orders
     SCAN_SECONDS = 30
 
     adaptive = AdaptiveParams()
-
-    if LIVE_TRADING and keys_valid:
-        log.warning("⚠️ LIVE TRADING ENABLED – real orders will be placed on Coinbase")
-        data = RealMarketData(api_key, api_secret)
-        orders = AdaptiveOrderManager(data, adaptive, live_mode=True)
-    else:
-        if LIVE_TRADING and not keys_valid:
-            log.error("LIVE_TRADING is True but API keys are invalid. Falling back to paper trading.")
-        log.info("🔒 PAPER TRADING MODE – no real orders")
-        data = RealMarketData()
-        orders = AdaptiveOrderManager(data, adaptive, live_mode=False)
-
+    data = RealMarketData()       # No API keys needed
+    orders = AdaptiveOrderManager(data, adaptive, live_mode=False)
     strategy = AdaptiveHighProbStrategy(data, adaptive)
 
     log.info(f"Hard stop-loss: {orders.stop_loss_pct*100}% | Partial profit: {orders.partial_profit_pct*100}% | ATR multiplier: 1.5")
