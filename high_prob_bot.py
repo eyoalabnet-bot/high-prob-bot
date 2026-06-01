@@ -3,10 +3,11 @@
 High Probability Trading Bot – Coinbase Advanced Trade (JWT, no passphrase)
 - Real Bitcoin data from Coinbase
 - Optional live trading (set LIVE_TRADING = True and add API keys)
-- Adaptive pattern selection, trailing stop, profit target
-- Daily loss limit: $35 (stops trading after losing $35 in a day)
+- Adaptive pattern selection, trailing stop, profit target, stop-loss 1%
+- Dynamic daily loss limit: 20% of current balance (resets at midnight UTC)
+- Balance floor – stops trading if balance <= $0
 - Paper trading by default, simulated balance $100
-- Real position size: 0.0005 BTC (~$35) – safe for a $100 account
+- Real position size: 0.0005 BTC (~$35) – safe for $100 account
 """
 
 import time
@@ -17,7 +18,7 @@ import jwt
 import requests
 import numpy as np
 import random
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 logging.basicConfig(
     level=logging.INFO,
@@ -88,7 +89,6 @@ class CoinbaseClient:
             if resp.status_code == 200:
                 data = resp.json()
                 candles = []
-                # Coinbase returns: [time, low, high, open, close, volume]
                 for item in data:
                     candles.append({
                         "timestamp": item[0],
@@ -135,7 +135,6 @@ class RealMarketData:
         if self.coinbase:
             price = self.coinbase.get_current_price()
         if price is None:
-            # fallback to small random walk (rare)
             price = self.cached_price * (1 + random.uniform(-0.001, 0.001))
         self.cached_price = price
         self.last_price_fetch = now
@@ -170,7 +169,7 @@ class RealMarketData:
         return candles
 
     def get_previous_session_close(self) -> float:
-        candles = self.get_historical_candles(3600, 2)  # 1h
+        candles = self.get_historical_candles(3600, 2)
         if len(candles) >= 2:
             return candles[-2]["close"]
         return self.get_current_price() * 0.98
@@ -400,7 +399,7 @@ class AdaptiveHighProbStrategy:
         return None
 
 
-# ---------- Order Manager (Simulated + Live) – Daily loss limit $35 ----------
+# ---------- Order Manager with Dynamic Daily Loss Limit ----------
 class AdaptiveOrderManager:
     def __init__(self, data_client, adaptive_params, live_mode=False):
         self.data = data_client
@@ -412,21 +411,21 @@ class AdaptiveOrderManager:
         self.balance = 100.0               # simulated starting balance
         self.trades = []
         self.last_trade_time = 0
-        self.cooldown_seconds = 300
+        self.cooldown_seconds = 600        # 10 minutes
         self.last_price_at_trade = 0.0
         self.min_price_change_pct = 0.003
         self.trailing_stop_pct = 0.002
-        self.profit_target_pct = 0.01
+        self.profit_target_pct = 0.01      # 1%
+        self.stop_loss_pct = 0.01          # 1% per trade
         self.highest_price = 0.0
-        self.max_btc_size = 0.0005         # ~$35 per trade – safe for $100 account
+        self.max_btc_size = 0.0005         # ~$35 per trade
 
-        # Daily loss limit ($35)
-        self.daily_loss_limit = 35.0
+        # Dynamic daily loss limit: 20% of current balance
+        self.daily_loss_limit_pct = 0.20   # 20% of balance
         self.daily_pnl = 0.0
         self.last_reset_day = datetime.now(timezone.utc).date()
 
     def _reset_daily_pnl_if_needed(self):
-        """Reset daily PnL at midnight UTC."""
         today = datetime.now(timezone.utc).date()
         if today != self.last_reset_day:
             self.daily_pnl = 0.0
@@ -435,6 +434,11 @@ class AdaptiveOrderManager:
 
     def can_enter(self, current_price) -> bool:
         self._reset_daily_pnl_if_needed()
+
+        # Balance floor – prevent blow
+        if self.balance <= 0.0:
+            log.critical("Account balance is ZERO or NEGATIVE – trading permanently halted.")
+            return False
 
         now = time.time()
         if self.position != 0:
@@ -446,9 +450,10 @@ class AdaptiveOrderManager:
             if pct_change < self.min_price_change_pct:
                 return False
 
-        # Daily loss limit check
-        if self.daily_pnl <= -self.daily_loss_limit:
-            log.warning(f"Daily loss limit reached (${-self.daily_pnl:.2f} lost). No more trades today.")
+        # Dynamic daily loss limit (percentage of current balance)
+        daily_limit_abs = self.balance * self.daily_loss_limit_pct
+        if self.daily_pnl <= -daily_limit_abs:
+            log.warning(f"Daily loss limit reached (lost {self.daily_pnl:.2f}, limit {daily_limit_abs:.2f} = {self.daily_loss_limit_pct*100}% of balance). No more trades today.")
             return False
 
         return True
@@ -480,16 +485,28 @@ class AdaptiveOrderManager:
     def update_exit(self, current_price):
         if self.position == 0:
             return False
+
+        # Hard stop-loss (1% from entry)
+        stop_loss_price = self.entry_price * (1 - self.stop_loss_pct)
+        if current_price <= stop_loss_price:
+            log.info(f"🛑 Stop-loss hit (1% loss from entry ${self.entry_price:,.2f})")
+            return True
+
         if current_price > self.highest_price:
             self.highest_price = current_price
+
+        # Profit target (1%)
         profit_target = self.entry_price * (1 + self.profit_target_pct)
         if current_price >= profit_target:
-            log.info(f"✅ Profit target hit ({self.profit_target_pct*100}%)")
+            log.info(f"✅ Profit target hit (1%)")
             return True
+
+        # Trailing stop (0.2% from highest)
         trail_stop = self.highest_price * (1 - self.trailing_stop_pct)
         if current_price <= trail_stop:
             log.info(f"🔻 Trailing stop hit (high: {self.highest_price:.2f}, stop: {trail_stop:.2f})")
             return True
+
         return False
 
     def execute_sell(self, price: float, contracts: int = 1):
@@ -499,7 +516,7 @@ class AdaptiveOrderManager:
             result = self.data.place_order("sell", self.max_btc_size)
             if result and "order_id" in result:
                 pnl = (price - self.entry_price) * self.max_btc_size
-                self.balance += pnl   # local tracking only
+                self.balance += pnl
                 self.daily_pnl += pnl
                 log.info(f"🔴 LIVE SELL {self.max_btc_size} BTC @ ${price:,.2f} | PnL: ${pnl:.2f} | Daily PnL: ${self.daily_pnl:.2f}")
             else:
@@ -525,13 +542,13 @@ class AdaptiveOrderManager:
 def main():
     log.info("===== High Probability Bot – Coinbase Advanced Trade (JWT) =====")
     log.info("Position size: 0.0005 BTC per trade (≈ $35 at current prices)")
-    log.info("Daily loss limit: $35 (trading stops after losing $35 in a day)")
+    log.info("Per-trade stop-loss: 1% from entry")
+    log.info("Dynamic daily loss limit: 20% of current balance")
+    log.info("Balance floor: bot stops trading if simulated balance <= $0")
 
-    # --- CONFIGURATION ---
     LIVE_TRADING = False          # set to True to enable real orders
     SCAN_SECONDS = 30
 
-    # Get keys from environment variables (set in Railway)
     api_key = os.environ.get("COINBASE_API_KEY")
     api_secret = os.environ.get("COINBASE_API_SECRET")
 
@@ -545,14 +562,14 @@ def main():
         if LIVE_TRADING and (not api_key or not api_secret):
             log.error("LIVE_TRADING is True but API keys missing. Falling back to paper trading.")
         log.info("🔒 PAPER TRADING MODE – no real orders")
-        data = RealMarketData()   # no keys
+        data = RealMarketData()
         orders = AdaptiveOrderManager(data, adaptive, live_mode=False)
 
     strategy = AdaptiveHighProbStrategy(data, adaptive)
     CONTRACTS = 1
 
-    log.info(f"Trailing stop: {orders.trailing_stop_pct*100}% | Profit target: {orders.profit_target_pct*100}% | Cooldown: {orders.cooldown_seconds}s")
-    log.info(f"Scan interval: {SCAN_SECONDS}s")
+    log.info(f"Trailing stop: {orders.trailing_stop_pct*100}% | Profit target: {orders.profit_target_pct*100}% | Stop-loss: {orders.stop_loss_pct*100}%")
+    log.info(f"Cooldown: {orders.cooldown_seconds}s | Scan interval: {SCAN_SECONDS}s")
 
     try:
         while True:
@@ -570,7 +587,7 @@ def main():
                     orders.execute_sell(price, CONTRACTS)
                 else:
                     if int(time.time()) % 30 < SCAN_SECONDS:
-                        log.info(f"📈 Holding BTC @ ${price:,.2f} | Entry: ${orders.entry_price:,.2f} | High: ${orders.highest_price:,.2f} | Pattern: {orders.entry_pattern}")
+                        log.info(f"📈 Holding BTC @ ${price:,.2f} | Entry: ${orders.entry_price:,.2f} | High: ${orders.highest_price:,.2f} | Stop-loss: ${orders.entry_price * (1-orders.stop_loss_pct):,.2f}")
             time.sleep(SCAN_SECONDS)
     except KeyboardInterrupt:
         log.info("Shutting down – closing position")
