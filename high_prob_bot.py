@@ -3,8 +3,9 @@
 High Probability Trading Bot – Coinbase Advanced Trade (JWT, no passphrase)
 - Real Bitcoin data from Coinbase
 - Optional live trading (set LIVE_TRADING = True and add API keys)
-- Adaptive pattern selection, trailing stop, profit target, stop-loss 1%
-- Dynamic daily loss limit: 20% of current balance (resets at midnight UTC)
+- Adaptive pattern selection, trailing stop, hard stop-loss (1%)
+- NO profit target – lets winners run
+- Dynamic daily loss limit: 20% of current balance
 - Balance floor – stops trading if balance <= $0
 - Paper trading by default, simulated balance $100
 - Real position size: 0.0005 BTC (~$35) – safe for $100 account
@@ -399,7 +400,7 @@ class AdaptiveHighProbStrategy:
         return None
 
 
-# ---------- Order Manager with Dynamic Daily Loss Limit ----------
+# ---------- Order Manager: no profit target, only trailing stop + hard stop ----------
 class AdaptiveOrderManager:
     def __init__(self, data_client, adaptive_params, live_mode=False):
         self.data = data_client
@@ -408,20 +409,19 @@ class AdaptiveOrderManager:
         self.position = 0
         self.entry_price = 0.0
         self.entry_pattern = None
-        self.balance = 100.0               # simulated starting balance
+        self.balance = 100.0
         self.trades = []
         self.last_trade_time = 0
         self.cooldown_seconds = 600        # 10 minutes
         self.last_price_at_trade = 0.0
         self.min_price_change_pct = 0.003
-        self.trailing_stop_pct = 0.002
-        self.profit_target_pct = 0.01      # 1%
-        self.stop_loss_pct = 0.01          # 1% per trade
+        self.trailing_stop_pct = 0.002     # 0.2% from highest price
+        self.stop_loss_pct = 0.01          # 1% hard stop from entry
         self.highest_price = 0.0
-        self.max_btc_size = 0.0005         # ~$35 per trade
+        self.max_btc_size = 0.0005
 
-        # Dynamic daily loss limit: 20% of current balance
-        self.daily_loss_limit_pct = 0.20   # 20% of balance
+        # Dynamic daily loss limit: 20% of balance
+        self.daily_loss_limit_pct = 0.20
         self.daily_pnl = 0.0
         self.last_reset_day = datetime.now(timezone.utc).date()
 
@@ -435,7 +435,6 @@ class AdaptiveOrderManager:
     def can_enter(self, current_price) -> bool:
         self._reset_daily_pnl_if_needed()
 
-        # Balance floor – prevent blow
         if self.balance <= 0.0:
             log.critical("Account balance is ZERO or NEGATIVE – trading permanently halted.")
             return False
@@ -450,10 +449,9 @@ class AdaptiveOrderManager:
             if pct_change < self.min_price_change_pct:
                 return False
 
-        # Dynamic daily loss limit (percentage of current balance)
         daily_limit_abs = self.balance * self.daily_loss_limit_pct
         if self.daily_pnl <= -daily_limit_abs:
-            log.warning(f"Daily loss limit reached (lost {self.daily_pnl:.2f}, limit {daily_limit_abs:.2f} = {self.daily_loss_limit_pct*100}% of balance). No more trades today.")
+            log.warning(f"Daily loss limit reached (lost {self.daily_pnl:.2f}, limit {daily_limit_abs:.2f})")
             return False
 
         return True
@@ -472,7 +470,7 @@ class AdaptiveOrderManager:
                 self.highest_price = price
                 log.info(f"🔵 LIVE BUY {self.max_btc_size} BTC @ ${price:,.2f} (Pattern: {pattern})")
             else:
-                log.error("Live buy failed, not entering simulated position")
+                log.error("Live buy failed")
         else:
             self.position = contracts
             self.entry_price = price
@@ -486,27 +484,23 @@ class AdaptiveOrderManager:
         if self.position == 0:
             return False
 
-        # Hard stop-loss (1% from entry)
+        # 1. Hard stop-loss (1% from entry)
         stop_loss_price = self.entry_price * (1 - self.stop_loss_pct)
         if current_price <= stop_loss_price:
             log.info(f"🛑 Stop-loss hit (1% loss from entry ${self.entry_price:,.2f})")
             return True
 
+        # 2. Update highest price seen (for trailing stop)
         if current_price > self.highest_price:
             self.highest_price = current_price
 
-        # Profit target (1%)
-        profit_target = self.entry_price * (1 + self.profit_target_pct)
-        if current_price >= profit_target:
-            log.info(f"✅ Profit target hit (1%)")
-            return True
-
-        # Trailing stop (0.2% from highest)
+        # 3. Trailing stop (0.2% from highest)
         trail_stop = self.highest_price * (1 - self.trailing_stop_pct)
         if current_price <= trail_stop:
             log.info(f"🔻 Trailing stop hit (high: {self.highest_price:.2f}, stop: {trail_stop:.2f})")
             return True
 
+        # No profit target – let winners run
         return False
 
     def execute_sell(self, price: float, contracts: int = 1):
@@ -541,12 +535,12 @@ class AdaptiveOrderManager:
 # ---------- Main ----------
 def main():
     log.info("===== High Probability Bot – Coinbase Advanced Trade (JWT) =====")
+    log.info("No profit target – trailing stop (0.2%) lets winners run, hard stop-loss (1%) cuts losers")
     log.info("Position size: 0.0005 BTC per trade (≈ $35 at current prices)")
-    log.info("Per-trade stop-loss: 1% from entry")
     log.info("Dynamic daily loss limit: 20% of current balance")
     log.info("Balance floor: bot stops trading if simulated balance <= $0")
 
-    LIVE_TRADING = False          # set to True to enable real orders
+    LIVE_TRADING = False
     SCAN_SECONDS = 30
 
     api_key = os.environ.get("COINBASE_API_KEY")
@@ -568,7 +562,7 @@ def main():
     strategy = AdaptiveHighProbStrategy(data, adaptive)
     CONTRACTS = 1
 
-    log.info(f"Trailing stop: {orders.trailing_stop_pct*100}% | Profit target: {orders.profit_target_pct*100}% | Stop-loss: {orders.stop_loss_pct*100}%")
+    log.info(f"Trailing stop: {orders.trailing_stop_pct*100}% | Hard stop-loss: {orders.stop_loss_pct*100}%")
     log.info(f"Cooldown: {orders.cooldown_seconds}s | Scan interval: {SCAN_SECONDS}s")
 
     try:
