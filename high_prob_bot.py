@@ -2,7 +2,7 @@
 """
 High Probability Trading Bot – Coinbase Advanced Trade (JWT)
 - Full bot logic (trend filter, ATR stop, partial profit, daily loss limit)
-- Includes temporary API key check in logs
+- Includes **API key validation** at startup (checks if keys are actually correct)
 """
 
 import time
@@ -286,7 +286,7 @@ class AdaptiveParams:
         return np.random.choice(patterns, p=probs)
 
 
-# ---------- Strategy (with trend filter, ATR, partial profit) ----------
+# ---------- Strategy (trend filter, pattern detection) ----------
 class AdaptiveHighProbStrategy:
     def __init__(self, data_client, adaptive_params):
         self.data = data_client
@@ -408,7 +408,7 @@ class AdaptiveHighProbStrategy:
         return None
 
 
-# ---------- Order Manager (with stop-loss, partial profit, ATR trailing) ----------
+# ---------- Order Manager (stop-loss, partial profit, ATR trailing) ----------
 class AdaptiveOrderManager:
     def __init__(self, data_client, adaptive_params, live_mode=False):
         self.data = data_client
@@ -583,11 +583,30 @@ class AdaptiveOrderManager:
 def main():
     log.info("===== High Probability Bot – Coinbase Advanced Trade (JWT) =====")
 
-    # --- TEMPORARY API KEY CHECK (easiest verification) ---
+    # --- API key presence check ---
     api_key = os.environ.get("COINBASE_API_KEY")
     api_secret = os.environ.get("COINBASE_API_SECRET")
     log.info(f"🔑 API keys present? Key: {bool(api_key)}, Secret: {bool(api_secret)}")
-    # -------------------------------------------------------
+
+    # --- VALIDATE the keys by making an authenticated call ---
+    keys_valid = False
+    if api_key and api_secret:
+        try:
+            test_client = RealMarketData(api_key, api_secret)
+            if test_client.coinbase:
+                # Try to fetch account list (requires valid credentials)
+                result = test_client.coinbase._request("GET", "/api/v3/brokerage/accounts")
+                if result and 'accounts' in result:
+                    log.info("✅ API keys are VALID! Successfully fetched account data.")
+                    keys_valid = True
+                else:
+                    log.error("❌ API keys appear INVALID – check permissions or key format.")
+            else:
+                log.error("❌ Failed to create Coinbase client.")
+        except Exception as e:
+            log.error(f"❌ API validation failed: {e}")
+    else:
+        log.warning("⚠️ API keys missing – validation skipped.")
 
     log.info("Position size: 0.0005 BTC per trade (≈ $35 at current prices)")
     log.info("Trend filter: 1h EMA(50) – trades only in direction of trend")
@@ -601,13 +620,13 @@ def main():
 
     adaptive = AdaptiveParams()
 
-    if LIVE_TRADING and api_key and api_secret:
+    if LIVE_TRADING and keys_valid:
         log.warning("⚠️ LIVE TRADING ENABLED – real orders will be placed on Coinbase")
         data = RealMarketData(api_key, api_secret)
         orders = AdaptiveOrderManager(data, adaptive, live_mode=True)
     else:
-        if LIVE_TRADING and (not api_key or not api_secret):
-            log.error("LIVE_TRADING is True but API keys missing. Falling back to paper trading.")
+        if LIVE_TRADING and not keys_valid:
+            log.error("LIVE_TRADING is True but API keys are invalid. Falling back to paper trading.")
         log.info("🔒 PAPER TRADING MODE – no real orders")
         data = RealMarketData()
         orders = AdaptiveOrderManager(data, adaptive, live_mode=False)
