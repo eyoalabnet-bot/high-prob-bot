@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
 """
-High Probability Trading Bot – Coinbase Advanced Trade
-- PAPER TRADING MODE by default (LIVE_TRADING = False)
-- Includes full API key validation at startup
-- Handles private key with literal \n (converts to real newlines)
-- Real market data from Coinbase public endpoints
-- Simulated trades with 0.0005 BTC position size (~$25)
-- Daily loss limit, trailing stop, partial profit, trend filter
+High Probability Trading Bot – Kraken Spot (Paper Trading Mode)
+- Real Bitcoin data from Kraken public endpoints
+- Simulated trading only – no real orders (LIVE_TRADING = False)
+- Uses 0.0005 BTC position size (~$25 at 50k BTC)
+- Includes trend filter (1h SMA), ATR trailing stop, partial profit taking
+- Daily loss limit: 20% of balance (resets at UTC midnight)
+- No API keys required for paper trading
 """
 
 import time
 import logging
 import json
 import os
-import jwt
-import requests
 import numpy as np
 import random
 from datetime import datetime, timezone
+from kraken.spot import Market, User
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,83 +25,44 @@ logging.basicConfig(
 )
 log = logging.getLogger("high_prob_bot")
 
-# ---------- Coinbase API Client (with newline fix and key validation) ----------
-class CoinbaseClient:
-    def __init__(self, api_key=None, api_secret=None, use_sandbox=False):
-        self.api_key = api_key
-        self.api_secret = api_secret
-        self.base_url = "https://api.coinbase.com" if not use_sandbox else "https://api-public.sandbox.exchange.coinbase.com"
-        self.product = "BTC-USD"
-        # Fix: convert literal '\n' to actual newlines
-        if self.api_secret and '\\n' in self.api_secret:
-            self.api_secret = self.api_secret.replace('\\n', '\n')
+# ---------- Kraken API (public data only, no keys needed for paper mode) ----------
+class KrakenClient:
+    def __init__(self, api_key=None, api_secret=None):
+        self.market = Market()  # Public endpoints only
+        self.user = None
+        self.pair = "XBT/USD"   # Kraken's BTC/USD pair format
+        if api_key and api_secret:
+            self.user = User(key=api_key, secret=api_secret)
 
-    def _generate_jwt(self, method, request_path, body=""):
-        if not self.api_key or not self.api_secret:
-            return None
-        uri = f"{method} {request_path}"
-        if body:
-            uri += body
-        current_time = int(time.time())
-        payload = {
-            "sub": self.api_key,
-            "iss": "coinbase-cloud",
-            "nbf": current_time,
-            "exp": current_time + 120,
-            "uri": uri
-        }
-        token = jwt.encode(payload, self.api_secret, algorithm='ES256')
-        return token
-
-    def _request(self, method, path, body=None):
-        if not self.api_key or not self.api_secret:
-            return None
-        url = self.base_url + path
-        body_str = json.dumps(body) if body else ""
-        token = self._generate_jwt(method, path, body_str)
-        if not token:
-            return None
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json"
-        }
-        try:
-            resp = requests.request(method, url, headers=headers, data=body_str, timeout=10)
-            if resp.status_code in [200, 201]:
-                return resp.json()
-            else:
-                log.error(f"Coinbase API error {resp.status_code}: {resp.text}")
-        except Exception as e:
-            log.error(f"Request error: {e}")
-        return None
-
-    # Public endpoints (no auth required)
     def get_current_price(self):
+        """Get real‑time price from Kraken ticker endpoint"""
         try:
-            url = f"https://api.exchange.coinbase.com/products/{self.product}/ticker"
-            resp = requests.get(url, timeout=10)
-            if resp.status_code == 200:
-                return float(resp.json()["price"])
+            ticker = self.market.get_ticker(pair=self.pair)
+            if ticker and self.pair in ticker:
+                return float(ticker[self.pair]['c'][0])  # 'c' = last price (close)
         except Exception as e:
             log.warning(f"Price fetch error: {e}")
         return None
 
-    def get_historical_candles(self, granularity: int, limit: int = 50):
+    def get_historical_candles(self, interval: int, limit: int = 50):
+        """
+        Fetch historical OHLC candles.
+        Kraken interval codes: 1=1min, 5=5min, 15=15min, 30=30min, 60=1h, 240=4h, 1440=1d
+        """
         try:
-            url = f"https://api.exchange.coinbase.com/products/{self.product}/candles"
-            params = {"granularity": granularity, "limit": limit}
-            resp = requests.get(url, params=params, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
+            ohlc = self.market.get_ohlc(pair=self.pair, interval=interval)
+            if ohlc and 'result' in ohlc:
+                data = ohlc['result'][self.pair]
                 candles = []
-                for item in data:
+                for item in data[:limit]:
                     candles.append({
                         "timestamp": item[0],
-                        "open": float(item[3]),
+                        "open": float(item[1]),
                         "high": float(item[2]),
-                        "low": float(item[1]),
+                        "low": float(item[3]),
                         "close": float(item[4]),
-                        "volume": float(item[5])
+                        "volume": float(item[5]),
+                        "trades": item[6]
                     })
                 return candles
         except Exception as e:
@@ -114,27 +74,32 @@ class CoinbaseClient:
         return None
 
 
-# ---------- Market Data Wrapper (uses public data) ----------
+# ---------- Market Data Wrapper ----------
 class RealMarketData:
     def __init__(self, api_key=None, api_secret=None):
-        self.coinbase = CoinbaseClient(api_key, api_secret) if api_key and api_secret else CoinbaseClient()
+        self.kraken = KrakenClient(api_key, api_secret)
         self.cached_price = 50000.0
         self.last_price_fetch = 0
         self.price_cache_ttl = 5
+
+        # Kraken interval mapping
+        self.interval_map = {
+            1: 1, 5: 5, 15: 15, 60: 60, 240: 240, 1440: 1440
+        }
 
     def get_current_price(self) -> float:
         now = time.time()
         if now - self.last_price_fetch < self.price_cache_ttl:
             return self.cached_price
-        price = self.coinbase.get_current_price()
+        price = self.kraken.get_current_price()
         if price is None:
             price = self.cached_price * (1 + random.uniform(-0.001, 0.001))
         self.cached_price = price
         self.last_price_fetch = now
         return price
 
-    def get_historical_candles(self, granularity: int, limit: int = 50) -> list:
-        candles = self.coinbase.get_historical_candles(granularity, limit)
+    def get_historical_candles(self, interval: int, limit: int = 50) -> list:
+        candles = self.kraken.get_historical_candles(interval, limit)
         if not candles:
             candles = self._generate_simulated_candles(limit)
         return candles
@@ -154,29 +119,29 @@ class RealMarketData:
                 "high": round(high, 2),
                 "low": round(low, 2),
                 "close": round(close, 2),
-                "volume": random.randint(100, 10000)
+                "volume": random.randint(100, 10000),
+                "trades": random.randint(1, 500)
             })
             price = close
         return candles
 
     def get_previous_session_close(self) -> float:
-        candles = self.get_historical_candles(3600, 2)
+        candles = self.get_historical_candles(60, 2)  # 1h
         if len(candles) >= 2:
             return candles[-2]["close"]
         return self.get_current_price() * 0.98
 
     def generate_candles(self, timeframe_min: int, count: int) -> list:
-        granularity_map = {1: 60, 5: 300, 15: 900, 60: 3600, 240: 14400, 1440: 86400}
-        if timeframe_min not in granularity_map:
-            raise ValueError(f"Unsupported timeframe {timeframe_min}")
-        granularity = granularity_map[timeframe_min]
-        return self.get_historical_candles(granularity, count)
+        if timeframe_min not in self.interval_map:
+            raise ValueError(f"Unsupported timeframe {timeframe_min} – use 1,5,15,60,240,1440")
+        interval = self.interval_map[timeframe_min]
+        return self.get_historical_candles(interval, count)
 
     def place_order(self, side: str, size: float, price=None):
-        return self.coinbase.place_order(side, size, price)
+        return self.kraken.place_order(side, size, price)
 
 
-# ---------- Adaptive Parameters (with persistence) ----------
+# ---------- Adaptive Parameters ----------
 class AdaptiveParams:
     def __init__(self, state_file="learning_state.json"):
         self.state_file = state_file
@@ -292,20 +257,20 @@ class AdaptiveHighProbStrategy:
         self.last_pattern_used = None
 
     def get_trend_direction(self) -> str:
-        candles = self.data.generate_candles(60, 60)
+        candles = self.data.generate_candles(60, 60)  # 1h candles
         if len(candles) < 50:
             return "neutral"
         closes = [c['close'] for c in candles[-50:]]
-        ema = np.mean(closes)
+        sma = np.mean(closes)  # Simple moving average
         current_price = closes[-1]
-        if current_price > ema:
+        if current_price > sma:
             return "bullish"
-        elif current_price < ema:
+        elif current_price < sma:
             return "bearish"
         return "neutral"
 
     def check_engulfing_with_volume(self, current_price):
-        candles = self.data.generate_candles(1, 5)
+        candles = self.data.generate_candles(1, 5)  # 1-minute candles
         if len(candles) < 2:
             return None
         prev_close = self.data.get_previous_session_close()
@@ -337,7 +302,7 @@ class AdaptiveHighProbStrategy:
         return 100 - (100 / (1 + rs))
 
     def check_divergence(self, current_price):
-        candles = self.data.generate_candles(15, 30)
+        candles = self.data.generate_candles(15, 30)  # 15-minute candles
         if len(candles) < 10:
             return None
         prices_15m = [c['close'] for c in candles]
@@ -354,7 +319,7 @@ class AdaptiveHighProbStrategy:
         return None
 
     def check_double_pattern(self, current_price):
-        candles = self.data.generate_candles(5, 50)
+        candles = self.data.generate_candles(5, 50)  # 5-minute candles
         if len(candles) < 30:
             return None
         lows = [c['low'] for c in candles[-30:]]
@@ -405,7 +370,7 @@ class AdaptiveHighProbStrategy:
         return None
 
 
-# ---------- Order Manager (Paper Trading Only, but live mode ready) ----------
+# ---------- Order Manager (Paper Trading Only) ----------
 class AdaptiveOrderManager:
     def __init__(self, data_client, adaptive_params, live_mode=False):
         self.data = data_client
@@ -418,9 +383,10 @@ class AdaptiveOrderManager:
         self.balance = 100.0
         self.trades = []
         self.last_trade_time = 0
-        self.cooldown_seconds = 600
+        # TESTING VALUES (reduce cooldown and price change threshold)
+        self.cooldown_seconds = 30           # was 600 – trade every 30 seconds
         self.last_price_at_trade = 0.0
-        self.min_price_change_pct = 0.003
+        self.min_price_change_pct = 0.001    # was 0.003 – 0.1% price movement
         self.stop_loss_pct = 0.01
         self.partial_profit_pct = 0.015
         self.highest_price = 0.0
@@ -431,7 +397,7 @@ class AdaptiveOrderManager:
         self.last_reset_day = datetime.now(timezone.utc).date()
 
     def get_atr(self, period=14) -> float:
-        candles = self.data.generate_candles(5, period+1)
+        candles = self.data.generate_candles(5, period+1)  # 5-minute candles for ATR
         if len(candles) < period+1:
             return 200.0
         true_ranges = []
@@ -476,7 +442,7 @@ class AdaptiveOrderManager:
         size = self.position_size_btc
         if self.live_mode:
             result = self.data.place_order("buy", size)
-            if result and "order_id" in result:
+            if result:
                 self.position = size
                 self.remaining_position = size
                 self.entry_price = price
@@ -538,7 +504,7 @@ class AdaptiveOrderManager:
         size = self.remaining_position
         if self.live_mode:
             result = self.data.place_order("sell", size)
-            if result and "order_id" in result:
+            if result:
                 pnl = (price - self.entry_price) * size
                 self.balance += pnl
                 self.daily_pnl += pnl
@@ -565,43 +531,26 @@ class AdaptiveOrderManager:
 
 # ---------- Main ----------
 def main():
-    log.info("===== High Probability Bot – Coinbase Advanced Trade (Paper Mode + API Validation) =====")
-
-    # --- Read API keys from environment variables (Railway) ---
-    api_key = os.environ.get("COINBASE_API_KEY")
-    api_secret = os.environ.get("COINBASE_API_SECRET")
-    log.info(f"🔑 API keys present? Key: {bool(api_key)}, Secret: {bool(api_secret)}")
-
-    # --- Validate the keys (if present) ---
-    keys_valid = False
-    if api_key and api_secret:
-        try:
-            test_client = RealMarketData(api_key, api_secret)
-            if test_client.coinbase:
-                result = test_client.coinbase._request("GET", "/api/v3/brokerage/accounts")
-                if result and 'accounts' in result:
-                    log.info("✅ API keys are VALID! Successfully fetched account data.")
-                    keys_valid = True
-                else:
-                    log.error("❌ API keys appear INVALID – check permissions or key format.")
-            else:
-                log.error("❌ Failed to create Coinbase client.")
-        except Exception as e:
-            log.error(f"❌ API validation failed: {e}")
-    else:
-        log.warning("⚠️ API keys missing – validation skipped. Bot will run in paper mode only.")
-
-    log.info(f"Position size: 0.0005 BTC per trade (≈ $25 at current prices)")
-    log.info("Trend filter: 1h EMA(50) – trades only in direction of trend")
+    log.info("===== High Probability Bot – Kraken PAPER TRADING MODE =====")
+    log.info("Position size: 0.0005 BTC per trade (≈ $25 at current prices)")
+    log.info("Trend filter: 1h SMA(50) – trades only in direction of trend")
     log.info("Trailing stop: 1.5× ATR (dynamic)")
     log.info("Partial profit: take 50% at +1.5% profit, then trail the rest")
     log.info("Daily loss limit: 20% of current balance (resets at UTC midnight)")
 
-    LIVE_TRADING = False          # PAPER TRADING MODE – set to True ONLY after extensive testing
-    SCAN_SECONDS = 30
+    # API keys optional – only needed for live trading
+    api_key = os.environ.get("KRAKEN_API_KEY")
+    api_secret = os.environ.get("KRAKEN_API_SECRET")
+    if api_key and api_secret:
+        log.info("🔑 API keys present (but live trading disabled)")
+    else:
+        log.info("🔑 No API keys – bot will run in paper mode only")
+
+    LIVE_TRADING = False          # PAPER MODE – set to True only after extensive testing
+    SCAN_SECONDS = 10             # scan every 10 seconds for faster response
 
     adaptive = AdaptiveParams()
-    data = RealMarketData()       # Public data only – no keys needed for paper trading
+    data = RealMarketData()       # No API keys needed for market data
     orders = AdaptiveOrderManager(data, adaptive, live_mode=False)
     strategy = AdaptiveHighProbStrategy(data, adaptive)
 
