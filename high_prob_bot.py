@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """
-High Probability Trading Bot – Kraken Spot (Paper Trading Mode)
-- Balance fixed at $100 (simulated)
-- Stop-loss: 1.5% (wider to avoid premature exits)
-- Risk per trade: 20% of balance ($20)
-- Position size automatically capped by available cash
-- Profit target: 2× risk (2:1 reward)
-- Partial profit: close 50% at target, remainder trails with ATR
+High Probability Trading Bot – Kraken Spot (Paper Trading)
+- Improved win rate filters: stronger trend (200 SMA), volume factor 2.0, tighter double pattern (0.3%)
+- Multi‑timeframe confluence: 4h SMA(100) filter
+- Cooldown 60 seconds
+- Risk 20% of $100, stop-loss 1.5%, profit target 3% (2:1 reward)
 """
 
 import time
@@ -25,7 +23,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("high_prob_bot")
 
-# ---------- Kraken API (public data only for paper mode) ----------
+# ---------- Kraken API ----------
 class KrakenClient:
     def __init__(self, api_key=None, api_secret=None):
         self.market = Market()
@@ -139,8 +137,8 @@ class AdaptiveParams:
         self.pattern_weights = {'engulfing': 1.0, 'divergence': 1.0, 'double': 1.0}
         self.rsi_oversold = 30
         self.rsi_overbought = 70
-        self.volume_spike_factor = 1.5
-        self.double_pattern_tolerance = 0.005
+        self.volume_spike_factor = 2.0          # INCREASED from 1.5 to 2.0
+        self.double_pattern_tolerance = 0.003   # TIGHTER from 0.005 to 0.003 (0.3%)
         self.win_counts = {p: 0 for p in self.pattern_weights}
         self.total_counts = {p: 0 for p in self.pattern_weights}
         self.recent_winrate = {p: 0.5 for p in self.pattern_weights}
@@ -239,7 +237,7 @@ class AdaptiveParams:
         return np.random.choice(patterns, p=probs)
 
 
-# ---------- Strategy (unchanged) ----------
+# ---------- Strategy (with improved filters) ----------
 class AdaptiveHighProbStrategy:
     def __init__(self, data_client, adaptive_params):
         self.data = data_client
@@ -247,16 +245,28 @@ class AdaptiveHighProbStrategy:
         self.last_signal = None
         self.last_pattern_used = None
 
+    # Stronger trend filter: 200 SMA on 1h + 100 SMA on 4h
     def get_trend_direction(self) -> str:
-        candles = self.data.generate_candles(60, 60)
-        if len(candles) < 50:
+        # 1h SMA(200)
+        candles_1h = self.data.generate_candles(60, 210)
+        if len(candles_1h) < 200:
             return "neutral"
-        closes = [c['close'] for c in candles[-50:]]
-        sma = np.mean(closes)
-        current_price = closes[-1]
-        if current_price > sma:
+        closes_1h = [c['close'] for c in candles_1h[-200:]]
+        sma200_1h = sum(closes_1h) / len(closes_1h)
+        price_1h = closes_1h[-1]
+
+        # 4h SMA(100)
+        candles_4h = self.data.generate_candles(240, 110)
+        if len(candles_4h) < 100:
+            return "neutral"
+        closes_4h = [c['close'] for c in candles_4h[-100:]]
+        sma100_4h = sum(closes_4h) / len(closes_4h)
+        price_4h = closes_4h[-1]
+
+        # Require both timeframes to agree
+        if price_1h > sma200_1h and price_4h > sma100_4h:
             return "bullish"
-        elif current_price < sma:
+        elif price_1h < sma200_1h and price_4h < sma100_4h:
             return "bearish"
         return "neutral"
 
@@ -361,7 +371,7 @@ class AdaptiveHighProbStrategy:
         return None
 
 
-# ---------- Order Manager with 1.5% stop-loss (wider) ----------
+# ---------- Order Manager (risk 20% of $100, stop 1.5%, profit 3%, cooldown 60s) ----------
 class AdaptiveOrderManager:
     def __init__(self, data_client, adaptive_params, live_mode=False):
         self.data = data_client
@@ -378,15 +388,15 @@ class AdaptiveOrderManager:
         self.last_price_at_trade = 0.0
 
         # Risk parameters
-        self.risk_per_trade_pct = 0.20        # Risk 20% of current balance
-        self.stop_loss_pct = 0.015            # CHANGED: 1.5% stop-loss (was 1%)
-        self.reward_ratio = 2.0               # Profit target = 2 × risk
-        self.partial_profit_ratio = 0.5       # Close 50% at target
+        self.risk_per_trade_pct = 0.20        # Risk 20% of balance
+        self.stop_loss_pct = 0.015            # 1.5% stop-loss
+        self.reward_ratio = 2.0               # Profit target = 2 × risk → 3% target
+        self.partial_profit_ratio = 0.5       # Close 50% at target (optional)
         self.trailing_stop_pct = 0.002        # 0.2% trailing (if ATR disabled)
         self.use_atr_trailing = True          # Use ATR for trailing stop
 
-        # Cooldown and price filter
-        self.cooldown_seconds = 30
+        # Cooldown and price filter – increased cooldown
+        self.cooldown_seconds = 60            # was 30 – now 60 seconds
         self.min_price_change_pct = 0.001
 
         # Daily loss limit (20% of balance)
@@ -425,7 +435,6 @@ class AdaptiveOrderManager:
             log.info("Daily PnL reset to 0 (new trading day)")
 
     def _compute_position_size(self, entry_price):
-        """Risk 20% of $100 = $20. Stop distance = entry * 0.015. Size = $20 / stop_distance, capped by cash."""
         risk_amount = self.balance * self.risk_per_trade_pct
         stop_distance = entry_price * self.stop_loss_pct
         if stop_distance <= 0:
@@ -506,12 +515,12 @@ class AdaptiveOrderManager:
         if self.position == 0.0:
             return False
 
-        # 1. Hard stop-loss (now 1.5% from entry)
+        # Hard stop-loss (1.5%)
         if current_price <= self.stop_loss_price:
             log.info(f"🛑 Stop-loss hit (1.5% loss from entry ${self.entry_price:,.2f})")
             return True
 
-        # 2. Profit target (2× risk)
+        # Profit target (3% – because stop 1.5% × reward 2)
         if current_price >= self.profit_target_price and not self.partial_taken and self.remaining_position > 0:
             close_size = self.remaining_position * self.partial_profit_ratio
             if close_size >= 0.00001:
@@ -520,7 +529,7 @@ class AdaptiveOrderManager:
                 pnl = (current_price - self.entry_price) * close_size
                 self.balance += pnl
                 self.daily_pnl += pnl
-                log.info(f"🎯 Profit target hit (2× risk) – closing {close_size:.6f} BTC, profit ${pnl:.2f}. Remaining {self.remaining_position:.6f} BTC")
+                log.info(f"🎯 Profit target hit (3% profit) – closing {close_size:.6f} BTC, profit ${pnl:.2f}. Remaining {self.remaining_position:.6f} BTC")
                 self._partial_sell(current_price, close_size)
                 self.partial_taken = True
 
@@ -528,7 +537,7 @@ class AdaptiveOrderManager:
         if current_price > self.highest_price:
             self.highest_price = current_price
 
-        # 3. Trailing stop (1.5× ATR)
+        # Trailing stop (1.5× ATR)
         if self.use_atr_trailing:
             atr = self.get_atr()
             trail_stop = self.highest_price - (atr * 1.5)
@@ -580,11 +589,11 @@ class AdaptiveOrderManager:
 
 # ---------- Main ----------
 def main():
-    log.info("===== High Probability Bot – Kraken PAPER TRADING MODE =====")
-    log.info("Adaptive risk: 20% of $100 balance per trade | Reward: 2× risk | Stop-loss: 1.5%")
-    log.info("Position size automatically adjusted (capped by cash)")
-    log.info("Trend filter: 1h SMA(50) | Trailing stop: 1.5× ATR")
-    log.info("Daily loss limit: 20% of current balance (resets at UTC midnight)")
+    log.info("===== High Probability Bot – Kraken PAPER TRADING (Improved Win Rate) =====")
+    log.info("Filters: 1h SMA(200) + 4h SMA(100) trend confluence")
+    log.info("Volume spike factor: 2.0 | Double pattern tolerance: 0.3%")
+    log.info("Risk: 20% of $100 per trade | Stop-loss: 1.5% | Profit target: 3% (2:1 reward)")
+    log.info("Cooldown: 60 seconds | Trailing stop: 1.5× ATR")
 
     # API keys optional – only needed for live trading
     api_key = os.environ.get("KRAKEN_API_KEY")
@@ -602,7 +611,7 @@ def main():
     orders = AdaptiveOrderManager(data, adaptive, live_mode=False)
     strategy = AdaptiveHighProbStrategy(data, adaptive)
 
-    log.info(f"Stop-loss: {orders.stop_loss_pct*100}% | Reward ratio: {orders.reward_ratio}:1 | Partial profit: {orders.partial_profit_ratio*100}% of position")
+    log.info(f"Stop-loss: {orders.stop_loss_pct*100}% | Reward ratio: {orders.reward_ratio}:1 | Partial profit: {orders.partial_profit_ratio*100}%")
     log.info(f"Cooldown: {orders.cooldown_seconds}s | Scan interval: {SCAN_SECONDS}s")
 
     try:
