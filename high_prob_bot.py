@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 High Probability Trading Bot – Kraken Spot (Paper Trading Mode)
-- Adaptive risk: 20% of current account balance per trade
-- Position size = min(risk_amount / stop_distance, cash / entry_price)
-- Profit target = 2 × risk (2:1 reward-to-risk)
-- Partial profit: close 50% at target, let remainder run with trailing stop
-- Uses real Kraken market data (XBTUSD) – no API keys required for paper trading
+- Balance fixed at $100 (simulated)
+- Stop-loss: 1.5% (wider to avoid premature exits)
+- Risk per trade: 20% of balance ($20)
+- Position size automatically capped by available cash
+- Profit target: 2× risk (2:1 reward)
+- Partial profit: close 50% at target, remainder trails with ATR
 """
 
 import time
@@ -29,7 +30,7 @@ class KrakenClient:
     def __init__(self, api_key=None, api_secret=None):
         self.market = Market()
         self.user = None
-        self.pair = "XBTUSD"          # Kraken's BTC/USD pair (public REST)
+        self.pair = "XBTUSD"
         if api_key and api_secret:
             self.user = User(key=api_key, secret=api_secret)
 
@@ -360,7 +361,7 @@ class AdaptiveHighProbStrategy:
         return None
 
 
-# ---------- Order Manager with Adaptive Risk (20% of balance, cash-aware) ----------
+# ---------- Order Manager with 1.5% stop-loss (wider) ----------
 class AdaptiveOrderManager:
     def __init__(self, data_client, adaptive_params, live_mode=False):
         self.data = data_client
@@ -376,11 +377,11 @@ class AdaptiveOrderManager:
         self.last_trade_time = 0
         self.last_price_at_trade = 0.0
 
-        # Risk parameters – adaptive 20% of balance
+        # Risk parameters
         self.risk_per_trade_pct = 0.20        # Risk 20% of current balance
-        self.stop_loss_pct = 0.01             # Hard stop-loss 1% from entry
-        self.reward_ratio = 2.0               # Profit target = 2 × risk (2:1 R:R)
-        self.partial_profit_ratio = 0.5       # Close 50% of position at profit target
+        self.stop_loss_pct = 0.015            # CHANGED: 1.5% stop-loss (was 1%)
+        self.reward_ratio = 2.0               # Profit target = 2 × risk
+        self.partial_profit_ratio = 0.5       # Close 50% at target
         self.trailing_stop_pct = 0.002        # 0.2% trailing (if ATR disabled)
         self.use_atr_trailing = True          # Use ATR for trailing stop
 
@@ -393,13 +394,15 @@ class AdaptiveOrderManager:
         self.daily_pnl = 0.0
         self.last_reset_day = datetime.now(timezone.utc).date()
 
+        # Simulated balance fixed at $100
+        self.balance = 100.0
+
         # Will be recalculated on each trade
         self.position_size_btc = 0.0
         self.stop_loss_price = 0.0
         self.profit_target_price = 0.0
         self.partial_taken = False
         self.highest_price = 0.0
-        self.balance = 100.0   # starting balance (simulated)
 
     def get_atr(self, period=14) -> float:
         candles = self.data.generate_candles(5, period+1)
@@ -422,20 +425,16 @@ class AdaptiveOrderManager:
             log.info("Daily PnL reset to 0 (new trading day)")
 
     def _compute_position_size(self, entry_price):
-        """
-        Adaptive position sizing based on 20% risk of current balance.
-        Also respects cash availability: cannot buy more BTC than balance / entry_price.
-        """
+        """Risk 20% of $100 = $20. Stop distance = entry * 0.015. Size = $20 / stop_distance, capped by cash."""
         risk_amount = self.balance * self.risk_per_trade_pct
         stop_distance = entry_price * self.stop_loss_pct
         if stop_distance <= 0:
             return 0.0
         size_by_risk = risk_amount / stop_distance
-        max_size_by_cash = self.balance / entry_price   # maximum BTC affordable
+        max_size_by_cash = self.balance / entry_price
         size = min(size_by_risk, max_size_by_cash)
-        # Ensure minimum trade size (Kraken minimum is 0.0001 BTC, but we set a safe floor)
         if size < 0.0001:
-            log.warning(f"Calculated position size {size:.6f} BTC is below Kraken minimum; skipping trade.")
+            log.warning(f"Calculated position size {size:.6f} BTC is below minimum; skipping trade.")
             return 0.0
         return size
 
@@ -507,12 +506,12 @@ class AdaptiveOrderManager:
         if self.position == 0.0:
             return False
 
-        # 1. Hard stop-loss (1% from entry)
+        # 1. Hard stop-loss (now 1.5% from entry)
         if current_price <= self.stop_loss_price:
-            log.info(f"🛑 Stop-loss hit (1% loss from entry ${self.entry_price:,.2f})")
+            log.info(f"🛑 Stop-loss hit (1.5% loss from entry ${self.entry_price:,.2f})")
             return True
 
-        # 2. Profit target reached (2× risk)
+        # 2. Profit target (2× risk)
         if current_price >= self.profit_target_price and not self.partial_taken and self.remaining_position > 0:
             close_size = self.remaining_position * self.partial_profit_ratio
             if close_size >= 0.00001:
@@ -524,13 +523,12 @@ class AdaptiveOrderManager:
                 log.info(f"🎯 Profit target hit (2× risk) – closing {close_size:.6f} BTC, profit ${pnl:.2f}. Remaining {self.remaining_position:.6f} BTC")
                 self._partial_sell(current_price, close_size)
                 self.partial_taken = True
-                # No return – let trailing stop handle remainder
 
-        # Update highest price (for trailing stop)
+        # Update highest price
         if current_price > self.highest_price:
             self.highest_price = current_price
 
-        # 3. Trailing stop (dynamic using ATR or fixed percentage)
+        # 3. Trailing stop (1.5× ATR)
         if self.use_atr_trailing:
             atr = self.get_atr()
             trail_stop = self.highest_price - (atr * 1.5)
@@ -547,7 +545,6 @@ class AdaptiveOrderManager:
         self.trades.append({'price': price, 'size': size, 'pnl': (price - self.entry_price) * size,
                             'pattern': self.entry_pattern, 'partial': True})
         self.adaptive.record_trade_result(self.entry_pattern, (price - self.entry_price) * size)
-        # No additional logging here – the calling function already logged.
 
     def execute_sell(self, price: float):
         if self.position == 0.0:
@@ -584,8 +581,8 @@ class AdaptiveOrderManager:
 # ---------- Main ----------
 def main():
     log.info("===== High Probability Bot – Kraken PAPER TRADING MODE =====")
-    log.info("Adaptive risk: 20% of current balance per trade | Reward: 2× risk | Partial profit at target (50%)")
-    log.info("Position size automatically adjusted to account balance (cash-aware)")
+    log.info("Adaptive risk: 20% of $100 balance per trade | Reward: 2× risk | Stop-loss: 1.5%")
+    log.info("Position size automatically adjusted (capped by cash)")
     log.info("Trend filter: 1h SMA(50) | Trailing stop: 1.5× ATR")
     log.info("Daily loss limit: 20% of current balance (resets at UTC midnight)")
 
