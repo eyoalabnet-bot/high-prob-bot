@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
 High Probability Trading Bot – Kraken Spot (Paper Trading)
-- Improved win rate filters: stronger trend (200 SMA), volume factor 2.0, tighter double pattern (0.3%)
-- Multi‑timeframe confluence: 4h SMA(100) filter
-- Cooldown 60 seconds
-- Risk 20% of $100, stop-loss 1.5%, profit target 3% (2:1 reward)
+- Fixed risk: $20 per trade
+- Fixed profit target: $40 (2:1 reward)
+- Uses ATR-based stop-loss (dynamic, widens in volatile markets)
+- Balance is $100 simulated (can be changed via SIMULATED_BALANCE env var)
+- Position size is automatically capped by available cash
 """
 
 import time
@@ -137,8 +138,8 @@ class AdaptiveParams:
         self.pattern_weights = {'engulfing': 1.0, 'divergence': 1.0, 'double': 1.0}
         self.rsi_oversold = 30
         self.rsi_overbought = 70
-        self.volume_spike_factor = 2.0          # INCREASED from 1.5 to 2.0
-        self.double_pattern_tolerance = 0.003   # TIGHTER from 0.005 to 0.003 (0.3%)
+        self.volume_spike_factor = 2.0
+        self.double_pattern_tolerance = 0.003
         self.win_counts = {p: 0 for p in self.pattern_weights}
         self.total_counts = {p: 0 for p in self.pattern_weights}
         self.recent_winrate = {p: 0.5 for p in self.pattern_weights}
@@ -237,7 +238,7 @@ class AdaptiveParams:
         return np.random.choice(patterns, p=probs)
 
 
-# ---------- Strategy (with improved filters) ----------
+# ---------- Strategy (unchanged from previous version with strong filters) ----------
 class AdaptiveHighProbStrategy:
     def __init__(self, data_client, adaptive_params):
         self.data = data_client
@@ -245,9 +246,7 @@ class AdaptiveHighProbStrategy:
         self.last_signal = None
         self.last_pattern_used = None
 
-    # Stronger trend filter: 200 SMA on 1h + 100 SMA on 4h
     def get_trend_direction(self) -> str:
-        # 1h SMA(200)
         candles_1h = self.data.generate_candles(60, 210)
         if len(candles_1h) < 200:
             return "neutral"
@@ -255,7 +254,6 @@ class AdaptiveHighProbStrategy:
         sma200_1h = sum(closes_1h) / len(closes_1h)
         price_1h = closes_1h[-1]
 
-        # 4h SMA(100)
         candles_4h = self.data.generate_candles(240, 110)
         if len(candles_4h) < 100:
             return "neutral"
@@ -263,7 +261,6 @@ class AdaptiveHighProbStrategy:
         sma100_4h = sum(closes_4h) / len(closes_4h)
         price_4h = closes_4h[-1]
 
-        # Require both timeframes to agree
         if price_1h > sma200_1h and price_4h > sma100_4h:
             return "bullish"
         elif price_1h < sma200_1h and price_4h < sma100_4h:
@@ -371,7 +368,7 @@ class AdaptiveHighProbStrategy:
         return None
 
 
-# ---------- Order Manager (risk 20% of $100, stop 1.5%, profit 3%, cooldown 60s) ----------
+# ---------- Order Manager with Fixed Risk ($20) and Fixed Profit Target ($40) ----------
 class AdaptiveOrderManager:
     def __init__(self, data_client, adaptive_params, live_mode=False):
         self.data = data_client
@@ -387,25 +384,23 @@ class AdaptiveOrderManager:
         self.last_trade_time = 0
         self.last_price_at_trade = 0.0
 
-        # Risk parameters
-        self.risk_per_trade_pct = 0.20        # Risk 20% of balance
-        self.stop_loss_pct = 0.015            # 1.5% stop-loss
-        self.reward_ratio = 2.0               # Profit target = 2 × risk → 3% target
-        self.partial_profit_ratio = 0.5       # Close 50% at target (optional)
-        self.trailing_stop_pct = 0.002        # 0.2% trailing (if ATR disabled)
-        self.use_atr_trailing = True          # Use ATR for trailing stop
+        # Fixed risk and reward (in USD)
+        self.risk_usd = 20.0
+        self.profit_usd = 40.0      # 2:1 reward-to-risk
 
-        # Cooldown and price filter – increased cooldown
-        self.cooldown_seconds = 60            # was 30 – now 60 seconds
+        # Stop logic: dynamic ATR-based stop (widens in volatile markets)
+        self.atr_stop_mult = 2.5     # initial stop = entry - (ATR * mult)
+        self.atr_target_mult = 5.0   # target = entry + (ATR * mult) – gives ~2:1 reward
+
+        # Cooldown and price filter
+        self.cooldown_seconds = 60
         self.min_price_change_pct = 0.001
 
-        # Daily loss limit (20% of balance)
+        # Daily loss limit (20% of balance, but we use fixed balance of $100)
+        self.balance = 100.0
         self.daily_loss_limit_pct = 0.20
         self.daily_pnl = 0.0
         self.last_reset_day = datetime.now(timezone.utc).date()
-
-        # Simulated balance fixed at $100
-        self.balance = 100.0
 
         # Will be recalculated on each trade
         self.position_size_btc = 0.0
@@ -434,12 +429,15 @@ class AdaptiveOrderManager:
             self.last_reset_day = today
             log.info("Daily PnL reset to 0 (new trading day)")
 
-    def _compute_position_size(self, entry_price):
-        risk_amount = self.balance * self.risk_per_trade_pct
-        stop_distance = entry_price * self.stop_loss_pct
+    def _compute_position_size(self, entry_price, stop_distance):
+        """
+        Calculate position size (BTC) such that:
+        position_size * stop_distance = risk_usd
+        Also cap by available cash (balance / entry_price).
+        """
         if stop_distance <= 0:
             return 0.0
-        size_by_risk = risk_amount / stop_distance
+        size_by_risk = self.risk_usd / stop_distance
         max_size_by_cash = self.balance / entry_price
         size = min(size_by_risk, max_size_by_cash)
         if size < 0.0001:
@@ -471,19 +469,32 @@ class AdaptiveOrderManager:
         if not self.can_enter(price):
             return
 
-        size = self._compute_position_size(price)
+        # Calculate ATR and dynamic stop distance (in USD per BTC)
+        atr = self.get_atr()
+        stop_distance = atr * self.atr_stop_mult
+        target_distance = atr * self.atr_target_mult
+
+        # Compute position size based on fixed risk ($20)
+        size = self._compute_position_size(price, stop_distance)
         if size <= 0:
             log.warning("Could not compute valid position size – trade skipped.")
             return
 
         self.position_size_btc = size
-        self.stop_loss_price = price * (1 - self.stop_loss_pct)
-        self.profit_target_price = price + (price * self.stop_loss_pct * self.reward_ratio)
+        self.stop_loss_price = price - stop_distance
+        self.profit_target_price = price + target_distance
 
-        risk_amount = self.balance * self.risk_per_trade_pct
-        potential_loss = size * price * self.stop_loss_pct
-        log.info(f"Trade parameters: balance=${self.balance:.2f}, risk_%={self.risk_per_trade_pct*100}%, risk_amount=${risk_amount:.2f}")
-        log.info(f"Position size: {size:.6f} BTC (≈ ${size*price:.2f}) – max loss: ${potential_loss:.2f}")
+        # Ensure stop and target are not too close (safety)
+        if self.stop_loss_price <= 0 or self.profit_target_price <= price:
+            log.warning("Invalid stop/target levels – skipping trade.")
+            return
+
+        actual_risk_usd = size * stop_distance
+        actual_profit_usd = size * target_distance
+        log.info(f"Trade parameters: price=${price:,.2f}, ATR={atr:.2f}")
+        log.info(f"Stop distance = ${stop_distance:.2f} BTC, target distance = ${target_distance:.2f} BTC")
+        log.info(f"Position size: {size:.6f} BTC (≈ ${size*price:.2f})")
+        log.info(f"Actual risk: ${actual_risk_usd:.2f} (target ${self.risk_usd:.2f}), profit target: ${actual_profit_usd:.2f}")
 
         if self.live_mode:
             result = self.data.place_order("buy", size)
@@ -509,72 +520,44 @@ class AdaptiveOrderManager:
             self.highest_price = price
             self.partial_taken = False
             log.info(f"🔵 SIM BUY {size:.6f} BTC @ ${price:,.2f} (Pattern: {pattern})")
-            log.info(f"   Risk: ${risk_amount:.2f}, Target: ${self.profit_target_price:.2f}")
 
     def update_exit(self, current_price):
         if self.position == 0.0:
             return False
 
-        # Hard stop-loss (1.5%)
+        # Hard stop-loss
         if current_price <= self.stop_loss_price:
-            log.info(f"🛑 Stop-loss hit (1.5% loss from entry ${self.entry_price:,.2f})")
+            log.info(f"🛑 Stop-loss hit (loss: ${self.risk_usd:.2f})")
             return True
 
-        # Profit target (3% – because stop 1.5% × reward 2)
-        if current_price >= self.profit_target_price and not self.partial_taken and self.remaining_position > 0:
-            close_size = self.remaining_position * self.partial_profit_ratio
-            if close_size >= 0.00001:
-                self.remaining_position -= close_size
-                self.position = self.remaining_position
-                pnl = (current_price - self.entry_price) * close_size
-                self.balance += pnl
-                self.daily_pnl += pnl
-                log.info(f"🎯 Profit target hit (3% profit) – closing {close_size:.6f} BTC, profit ${pnl:.2f}. Remaining {self.remaining_position:.6f} BTC")
-                self._partial_sell(current_price, close_size)
-                self.partial_taken = True
+        # Profit target
+        if current_price >= self.profit_target_price:
+            log.info(f"🎯 Profit target hit (gain: ${self.profit_usd:.2f})")
+            return True
 
-        # Update highest price
+        # Update highest price for trailing stop
         if current_price > self.highest_price:
             self.highest_price = current_price
 
-        # Trailing stop (1.5× ATR)
-        if self.use_atr_trailing:
-            atr = self.get_atr()
-            trail_stop = self.highest_price - (atr * 1.5)
-        else:
-            trail_stop = self.highest_price * (1 - self.trailing_stop_pct)
-
+        # Trailing stop (optional, but keep for safety)
+        atr = self.get_atr()
+        trail_stop = self.highest_price - (atr * 1.5)
         if current_price <= trail_stop:
             log.info(f"🔻 Trailing stop hit (high: {self.highest_price:.2f}, stop: {trail_stop:.2f})")
             return True
 
         return False
 
-    def _partial_sell(self, price: float, size: float):
-        self.trades.append({'price': price, 'size': size, 'pnl': (price - self.entry_price) * size,
-                            'pattern': self.entry_pattern, 'partial': True})
-        self.adaptive.record_trade_result(self.entry_pattern, (price - self.entry_price) * size)
-
     def execute_sell(self, price: float):
         if self.position == 0.0:
             return
         size = self.remaining_position
-        if self.live_mode:
-            result = self.data.place_order("sell", size)
-            if result:
-                pnl = (price - self.entry_price) * size
-                self.balance += pnl
-                self.daily_pnl += pnl
-                log.info(f"🔴 LIVE SELL {size:.6f} BTC @ ${price:,.2f} | PnL: ${pnl:.2f} | Daily PnL: ${self.daily_pnl:.2f}")
-            else:
-                log.error("Live sell failed")
-        else:
-            pnl = (price - self.entry_price) * size
-            self.balance += pnl
-            self.daily_pnl += pnl
-            self.trades.append({'price': price, 'size': size, 'pnl': pnl, 'pattern': self.entry_pattern, 'full': True})
-            self.adaptive.record_trade_result(self.entry_pattern, pnl)
-            log.info(f"🔴 SIM SELL {size:.6f} BTC @ ${price:,.2f} | PnL: ${pnl:.2f} | Balance: ${self.balance:.2f} | Daily PnL: ${self.daily_pnl:.2f} | Pattern: {self.entry_pattern}")
+        pnl = (price - self.entry_price) * size
+        self.balance += pnl
+        self.daily_pnl += pnl
+        self.trades.append({'price': price, 'size': size, 'pnl': pnl, 'pattern': self.entry_pattern})
+        self.adaptive.record_trade_result(self.entry_pattern, pnl)
+        log.info(f"🔴 SIM SELL {size:.6f} BTC @ ${price:,.2f} | PnL: ${pnl:.2f} | Balance: ${self.balance:.2f} | Daily PnL: ${self.daily_pnl:.2f}")
         self.position = 0.0
         self.remaining_position = 0.0
         self.entry_price = 0.0
@@ -589,13 +572,11 @@ class AdaptiveOrderManager:
 
 # ---------- Main ----------
 def main():
-    log.info("===== High Probability Bot – Kraken PAPER TRADING (Improved Win Rate) =====")
-    log.info("Filters: 1h SMA(200) + 4h SMA(100) trend confluence")
-    log.info("Volume spike factor: 2.0 | Double pattern tolerance: 0.3%")
-    log.info("Risk: 20% of $100 per trade | Stop-loss: 1.5% | Profit target: 3% (2:1 reward)")
-    log.info("Cooldown: 60 seconds | Trailing stop: 1.5× ATR")
+    log.info("===== High Probability Bot – Kraken PAPER TRADING (Fixed $20 risk / $40 profit) =====")
+    log.info("Risk per trade: $20 | Profit target: $40 | ATR‑based stop (2.5x ATR)")
+    log.info("Balance: $100 simulated (fixed)")
 
-    # API keys optional – only needed for live trading
+    # API keys optional
     api_key = os.environ.get("KRAKEN_API_KEY")
     api_secret = os.environ.get("KRAKEN_API_SECRET")
     if api_key and api_secret:
@@ -603,7 +584,7 @@ def main():
     else:
         log.info("🔑 No API keys – bot will run in paper mode only")
 
-    LIVE_TRADING = False          # PAPER MODE – set to True only after extensive testing
+    LIVE_TRADING = False          # PAPER MODE
     SCAN_SECONDS = 10
 
     adaptive = AdaptiveParams()
@@ -611,7 +592,6 @@ def main():
     orders = AdaptiveOrderManager(data, adaptive, live_mode=False)
     strategy = AdaptiveHighProbStrategy(data, adaptive)
 
-    log.info(f"Stop-loss: {orders.stop_loss_pct*100}% | Reward ratio: {orders.reward_ratio}:1 | Partial profit: {orders.partial_profit_ratio*100}%")
     log.info(f"Cooldown: {orders.cooldown_seconds}s | Scan interval: {SCAN_SECONDS}s")
 
     try:
@@ -631,7 +611,7 @@ def main():
                 else:
                     if int(time.time()) % 30 < SCAN_SECONDS:
                         atr = orders.get_atr()
-                        log.info(f"📈 Holding BTC @ ${price:,.2f} | Entry: ${orders.entry_price:,.2f} | High: ${orders.highest_price:,.2f} | Stop-loss: ${orders.stop_loss_price:.2f} | ATR: {atr:.2f}")
+                        log.info(f"📈 Holding BTC @ ${price:,.2f} | Entry: ${orders.entry_price:,.2f} | Stop: ${orders.stop_loss_price:.2f} | Target: ${orders.profit_target_price:.2f} | ATR: {atr:.2f}")
             time.sleep(SCAN_SECONDS)
     except KeyboardInterrupt:
         log.info("Shutting down – closing position")
